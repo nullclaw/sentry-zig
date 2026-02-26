@@ -464,6 +464,8 @@ Important:
 - Without `release`, sessions do not start.
 - `.application` mode tracks duration.
 - `.request` mode does not send duration and reports aggregated counts.
+- Request-mode aggregates are auto-flushed every `session_aggregate_flush_interval_ms` (default `60000`)
+  and also on explicit `flush(...)` / `close(...)`.
 
 ## Monitor Check-Ins
 

@@ -133,6 +133,7 @@ pub const Options = struct {
     install_signal_handlers: bool = true,
     auto_session_tracking: bool = false,
     session_mode: SessionMode = .application,
+    session_aggregate_flush_interval_ms: u64 = 60_000,
     shutdown_timeout_ms: u64 = 2000,
 };
 
@@ -151,6 +152,10 @@ pub const Client = struct {
     session_aggregates: std.ArrayListUnmanaged(SessionAggregateBucket) = .{},
     last_event_id: ?[32]u8 = null,
     mutex: std.Thread.Mutex = .{},
+    session_flush_mutex: std.Thread.Mutex = .{},
+    session_flush_condition: std.Thread.Condition = .{},
+    session_flush_shutdown: bool = false,
+    session_flush_thread: ?std.Thread = null,
     log_batch_mutex: std.Thread.Mutex = .{},
     log_batch_condition: std.Thread.Condition = .{},
     log_batch_items: std.ArrayListUnmanaged([]u8) = .{},
@@ -209,6 +214,7 @@ pub const Client = struct {
 
         try self.worker.start();
         self.startLogBatcher();
+        self.startSessionAggregateFlusher();
 
         std.fs.cwd().makePath(options.cache_dir) catch {};
 
@@ -1080,6 +1086,7 @@ pub const Client = struct {
     /// Flush and shut down the transport worker.
     /// Returns true when the queue was drained before shutdown.
     pub fn close(self: *Client, timeout_ms: ?u64) bool {
+        self.shutdownSessionAggregateFlusher();
         self.endSession(.exited);
         self.flushPendingSessionAggregates();
         self.shutdownLogBatcher();
@@ -1708,6 +1715,58 @@ pub const Client = struct {
         self.logBatcherLoop();
     }
 
+    fn sessionAggregateFlushIntervalNs(self: *Client) i128 {
+        return @as(i128, @intCast(self.options.session_aggregate_flush_interval_ms)) * std.time.ns_per_ms;
+    }
+
+    fn startSessionAggregateFlusher(self: *Client) void {
+        if (self.options.session_mode != .request) return;
+
+        self.session_flush_mutex.lock();
+        defer self.session_flush_mutex.unlock();
+
+        self.session_flush_shutdown = false;
+        if (self.session_flush_thread != null) return;
+
+        self.session_flush_thread = std.Thread.spawn(.{}, sessionAggregateFlusherThreadEntry, .{self}) catch null;
+    }
+
+    fn shutdownSessionAggregateFlusher(self: *Client) void {
+        self.session_flush_mutex.lock();
+        self.session_flush_shutdown = true;
+        self.session_flush_condition.signal();
+        self.session_flush_mutex.unlock();
+
+        if (self.session_flush_thread) |thread| {
+            thread.join();
+            self.session_flush_thread = null;
+        }
+    }
+
+    fn sessionAggregateFlusherLoop(self: *Client) void {
+        const interval_ns: u64 = @max(1, @as(u64, @intCast(self.sessionAggregateFlushIntervalNs())));
+
+        while (true) {
+            self.session_flush_mutex.lock();
+            if (self.session_flush_shutdown) {
+                self.session_flush_mutex.unlock();
+                return;
+            }
+
+            self.session_flush_condition.timedWait(&self.session_flush_mutex, interval_ns) catch {};
+            const should_shutdown = self.session_flush_shutdown;
+            self.session_flush_mutex.unlock();
+
+            if (should_shutdown) return;
+
+            self.flushPendingSessionAggregates();
+        }
+    }
+
+    fn sessionAggregateFlusherThreadEntry(self: *Client) void {
+        self.sessionAggregateFlusherLoop();
+    }
+
     fn sendSessionUpdate(self: *Client, session: *Session) bool {
         self.ensureSessionDistinctId(session);
 
@@ -1950,6 +2009,7 @@ test "Options struct has correct defaults" {
     try testing.expect(opts.install_signal_handlers);
     try testing.expect(!opts.auto_session_tracking);
     try testing.expectEqual(SessionMode.application, opts.session_mode);
+    try testing.expectEqual(@as(u64, 60_000), opts.session_aggregate_flush_interval_ms);
     try testing.expectEqual(@as(u64, 2000), opts.shutdown_timeout_ms);
     try testing.expectEqualStrings("/tmp/sentry-zig", opts.cache_dir);
 }
@@ -4304,6 +4364,33 @@ test "Client request session mode aggregates counts by distinct id" {
     try testing.expect(std.mem.indexOf(u8, sessions_payload.?, "\"exited\":2") != null);
     try testing.expect(std.mem.indexOf(u8, sessions_payload.?, "\"errored\":1") != null);
     try testing.expect(std.mem.indexOf(u8, sessions_payload.?, "\"did\":\"user-42\"") != null);
+}
+
+test "Client request session mode flushes aggregates on interval timer" {
+    var state = AtomicCountTransportState{};
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .release = "my-app@1.0.0",
+        .session_mode = .request,
+        .session_aggregate_flush_interval_ms = 20,
+        .transport = .{
+            .send_fn = atomicCountTransportSendFn,
+            .ctx = &state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    client.startSession();
+    client.endSession(.exited);
+
+    var attempts: usize = 0;
+    while (attempts < 60 and state.count.load(.seq_cst) == 0) : (attempts += 1) {
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+
+    try testing.expect(state.count.load(.seq_cst) > 0);
 }
 
 test "Client session distinct id uses scope user id" {

@@ -291,6 +291,7 @@ fn setupCheckoutIntegration(client: *sentry.Client, _: ?*anyopaque) void {
 | `install_signal_handlers` | `bool` | `true` | POSIX signal handler install |
 | `auto_session_tracking` | `bool` | `false` | Auto-start session on init |
 | `session_mode` | `SessionMode` | `.application` | `.application` / `.request` |
+| `session_aggregate_flush_interval_ms` | `u64` | `60000` | Request-mode aggregate auto-flush interval |
 | `shutdown_timeout_ms` | `u64` | `2000` | Timeout for shutdown flush |
 
 See [docs/USER_GUIDE.md](docs/USER_GUIDE.md) for full examples and edge cases.
