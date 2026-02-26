@@ -15,6 +15,8 @@ pub const Span = @import("transaction.zig").Span;
 pub const SpanStatus = @import("transaction.zig").SpanStatus;
 pub const TransactionOpts = @import("transaction.zig").TransactionOpts;
 pub const ChildSpanOpts = @import("transaction.zig").ChildSpanOpts;
+pub const Transport = @import("transport.zig").Transport;
+pub const MockTransport = @import("transport.zig").MockTransport;
 
 test {
     @import("std").testing.refAllDecls(@This());
