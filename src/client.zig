@@ -1696,6 +1696,7 @@ var before_send_saw_threads: bool = false;
 var before_send_first_frame_in_app: ?bool = null;
 var before_send_observed_server_name: ?[]const u8 = null;
 var before_send_observed_dist: ?[]const u8 = null;
+var before_send_breadcrumbs_match: bool = false;
 
 fn inspectTraceContextBeforeSend(event: *Event) ?*Event {
     before_send_saw_trace_context = hasTraceContext(event);
@@ -1730,6 +1731,27 @@ fn inspectServerNameBeforeSend(event: *Event) ?*Event {
 
 fn inspectDistBeforeSend(event: *Event) ?*Event {
     before_send_observed_dist = event.dist;
+    return event;
+}
+
+fn inspectBreadcrumbOrderBeforeSend(event: *Event) ?*Event {
+    before_send_breadcrumbs_match = false;
+    const breadcrumbs = event.breadcrumbs orelse return event;
+    if (breadcrumbs.len != 4) return event;
+
+    const expected = [_][]const u8{
+        "First breadcrumb",
+        "Second breadcrumb",
+        "Third breadcrumb",
+        "Fourth breadcrumb",
+    };
+
+    for (expected, 0..) |message, idx| {
+        const crumb_message = breadcrumbs[idx].message orelse return event;
+        if (!std.mem.eql(u8, crumb_message, message)) return event;
+    }
+
+    before_send_breadcrumbs_match = true;
     return event;
 }
 
@@ -1809,6 +1831,27 @@ test "Client clearBreadcrumbs removes previously added breadcrumbs" {
 
     client.clearBreadcrumbs();
     try testing.expectEqual(@as(usize, 0), client.scope.breadcrumbs.count);
+}
+
+test "Client breadcrumbs preserve order after clearing older entries" {
+    before_send_breadcrumbs_match = false;
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .before_send = inspectBreadcrumbOrderBeforeSend,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    client.addBreadcrumb(.{ .message = "Old breadcrumb to be removed", .category = "log" });
+    client.clearBreadcrumbs();
+    client.addBreadcrumb(.{ .message = "First breadcrumb", .category = "log" });
+    client.addBreadcrumb(.{ .message = "Second breadcrumb", .category = "log" });
+    client.addBreadcrumb(.{ .message = "Third breadcrumb", .category = "log" });
+    client.addBreadcrumb(.{ .message = "Fourth breadcrumb", .category = "log" });
+
+    try testing.expect(client.captureMessageId("breadcrumb-order", .warning) != null);
+    try testing.expect(before_send_breadcrumbs_match);
 }
 
 test "Client captureMessage injects default trace context into event" {
@@ -2342,6 +2385,29 @@ test "Client custom transport receives submitted envelopes" {
     try testing.expect(client.captureMessageId("custom-transport", .warning) != null);
     _ = client.flush(1000);
     try testing.expectEqual(@as(usize, 1), state.sent_count);
+}
+
+test "Client custom transport receives expected event payload content" {
+    var state = PayloadTransportState.init(testing.allocator);
+    defer state.deinit();
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .transport = .{
+            .send_fn = payloadTransportSendFn,
+            .ctx = &state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    try testing.expect(client.captureMessageId("factory-style-transport", .err) != null);
+    _ = client.flush(1000);
+
+    try testing.expectEqual(@as(usize, 1), state.sent_count);
+    try testing.expect(state.last_payload != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"factory-style-transport\"") != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"type\":\"event\"") != null);
 }
 
 test "Client before_send_transaction drops replacement pointers for memory safety" {
