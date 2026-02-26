@@ -85,6 +85,8 @@ Key methods:
 - `close(timeout_ms_or_null)` - ends the session, drains the queue, and stops the worker.
 - `deinit()` - standard safe shutdown path.
 
+If `Options.integrations` is provided, each integration setup callback runs during client initialization.
+
 ## Event Capture and event_id
 
 ### Message/exception
@@ -261,10 +263,47 @@ const client = try sentry.init(allocator, .{
 
 `traces_sampler` has priority over `traces_sample_rate`.
 
-For regular event messages, the SDK automatically adds `contexts.trace`
-if trace context is missing in the input event.
+For regular event messages, the SDK automatically adds default contexts
+(`contexts.trace`, `contexts.runtime`, `contexts.os`) when trace context
+is missing in the input event.
 For transaction envelopes, the SDK adds a dynamic trace header
 (`trace_id/public_key/sample_rate/sampled`).
+
+### Trace Propagation
+
+Continue an upstream trace from an incoming `sentry-trace` header:
+
+```zig
+var txn = try client.startTransactionFromSentryTrace(
+    .{
+        .name = "GET /orders",
+        .op = "http.server",
+    },
+    "0123456789abcdef0123456789abcdef-89abcdef01234567-1",
+);
+defer txn.deinit();
+```
+
+Or use both propagation headers in one call:
+
+```zig
+var txn2 = try client.startTransactionFromPropagationHeaders(
+    .{ .name = "GET /orders", .op = "http.server" },
+    maybe_sentry_trace_header,
+    maybe_baggage_header,
+);
+defer txn2.deinit();
+```
+
+Generate downstream propagation headers from a transaction:
+
+```zig
+const sentry_trace = try client.sentryTraceHeader(&txn, allocator);
+defer allocator.free(sentry_trace);
+
+const baggage = try client.baggageHeader(&txn, allocator);
+defer allocator.free(baggage);
+```
 
 ### attach_stacktrace
 
@@ -328,6 +367,8 @@ client.captureLog(&log_entry);
 For advanced fields, set `LogEntry.attributes` and `LogEntry.trace_id`
 before sending.
 
+Use `before_send_log` to drop or mutate structured logs before queueing.
+
 ## Hooks and Processors
 
 ### `before_send`
@@ -386,6 +427,9 @@ By default, handlers are installed for:
 Configuration:
 - `install_signal_handlers = true|false`
 - `cache_dir` for crash marker files.
+- `http_proxy` / `https_proxy` for explicit proxy URLs.
+- `transport` for custom envelope sender callback.
+- `max_request_body_size` to drop oversized envelopes.
 
 ## Production Checklist
 

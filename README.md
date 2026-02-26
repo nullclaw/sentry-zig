@@ -91,13 +91,15 @@ exe.root_module.addImport("sentry-zig", sentry_dep.module("sentry-zig"));
 | Scope enrichment | Implemented | User/tags/extras/contexts/breadcrumbs/fingerprint/transaction |
 | Attachments | Implemented | In-memory and file-backed attachments |
 | Transactions & spans | Implemented | Sampling + trace context serialization |
-| Event trace context bootstrap | Implemented | Captured events receive default `contexts.trace` when absent |
+| Event context bootstrap | Implemented | Captured events receive default `contexts.trace` + runtime/os contexts when absent |
 | Transaction DSC envelope header | Implemented | Envelope header includes `trace_id/public_key/sample_rate/sampled` |
+| Trace propagation headers | Implemented | `sentry-trace`/`baggage` generation + incoming `sentry-trace` continuation |
 | Traces sampler callback | Implemented | `traces_sampler` has priority over `traces_sample_rate` |
 | Sessions (application/request mode) | Implemented | Request mode disables duration tracking |
 | Monitor check-ins | Implemented | `check_in` envelopes with env inheritance |
 | Worker + queue draining | Implemented | Bounded queue + `flush`/`close` semantics |
 | Transport rate limits | Implemented | `Retry-After` + `X-Sentry-Rate-Limits` parsing |
+| Transport customization | Implemented | Custom transport callback + explicit HTTP/HTTPS proxy options |
 | Signal crash marker flow | Implemented | POSIX marker write/read cycle |
 | Hub/TLS scope stack | Implemented | Push/pop scopes + TLS current hub helpers |
 | Structured logs pipeline | Implemented | `log` envelope items + `captureLogMessage` API |
@@ -124,6 +126,29 @@ client.addBreadcrumb(.{ .category = "http", .message = "POST /checkout", .level 
 
 // Structured log
 client.captureLogMessage("checkout started", .info);
+```
+
+```zig
+// Continue trace from incoming sentry-trace header
+var txn = try client.startTransactionFromSentryTrace(
+    .{ .name = "GET /orders", .op = "http.server" },
+    "0123456789abcdef0123456789abcdef-89abcdef01234567-1",
+);
+defer txn.deinit();
+
+// Propagate trace downstream
+const sentry_trace = try client.sentryTraceHeader(&txn, allocator);
+defer allocator.free(sentry_trace);
+const baggage = try client.baggageHeader(&txn, allocator);
+defer allocator.free(baggage);
+
+// Variant that accepts both incoming headers
+var txn2 = try client.startTransactionFromPropagationHeaders(
+    .{ .name = "GET /orders", .op = "http.server" },
+    incoming_sentry_trace,
+    incoming_baggage,
+);
+defer txn2.deinit();
 ```
 
 ```zig
@@ -160,8 +185,19 @@ All options are provided via `sentry.Options` in `sentry.init`.
 | `max_breadcrumbs` | `u32` | `100` | Scope breadcrumb cap |
 | `attach_stacktrace` | `bool` | `false` | Attach synthetic thread stacktrace payload when event has no threads |
 | `send_default_pii` | `bool` | `false` | Reserved option for explicit PII policy toggles |
+| `in_app_include` | `?[]const []const u8` | `null` | Optional in-app include patterns for stack frame classification |
+| `in_app_exclude` | `?[]const []const u8` | `null` | Optional in-app exclude patterns for stack frame classification |
+| `default_integrations` | `bool` | `true` | Controls default integration behavior for future integrations |
+| `integrations` | `?[]const Integration` | `null` | Setup callbacks executed during client initialization |
 | `before_send` | `?*const fn (*Event) ?*Event` | `null` | Drop/mutate event before queueing |
 | `before_breadcrumb` | `?*const fn (Breadcrumb) ?Breadcrumb` | `null` | Drop/mutate breadcrumb |
+| `before_send_log` | `?*const fn (*LogEntry) ?*LogEntry` | `null` | Drop/mutate log entry before queueing |
+| `transport` | `?TransportConfig` | `null` | Custom transport callback override |
+| `http_proxy` | `?[]const u8` | `null` | Explicit HTTP proxy URL (fallback to env vars when unset) |
+| `https_proxy` | `?[]const u8` | `null` | Explicit HTTPS proxy URL (fallback to env vars when unset) |
+| `accept_invalid_certs` | `bool` | `false` | Transport TLS policy toggle reserved for advanced setups |
+| `max_request_body_size` | `?usize` | `null` | Drop envelopes larger than this byte size |
+| `enable_logs` | `bool` | `true` | Enable/disable structured log submissions |
 | `cache_dir` | `[]const u8` | `"/tmp/sentry-zig"` | Crash marker directory |
 | `user_agent` | `[]const u8` | `"sentry-zig/0.1.0"` | Transport User-Agent |
 | `install_signal_handlers` | `bool` | `true` | POSIX signal handler install |

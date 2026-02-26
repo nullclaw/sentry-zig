@@ -80,6 +80,9 @@ pub const TransactionOpts = struct {
     sample_rate: f64 = 1.0,
     release: ?[]const u8 = null,
     environment: ?[]const u8 = null,
+    parent_trace_id: ?[32]u8 = null,
+    parent_span_id: ?SpanId = null,
+    parent_sampled: ?bool = null,
 };
 
 /// A span within a transaction.
@@ -112,6 +115,7 @@ pub const Transaction = struct {
     event_id: [32]u8,
     trace_id: [32]u8,
     span_id: SpanId,
+    parent_span_id: ?SpanId = null,
     name: []const u8,
     op: ?[]const u8 = null,
     description: ?[]const u8 = null,
@@ -122,17 +126,18 @@ pub const Transaction = struct {
     allocator: Allocator,
     sampled: bool = true,
     sample_rate: f64 = 1.0,
+    parent_sampled: ?bool = null,
     release: ?[]const u8 = null,
     environment: ?[]const u8 = null,
 
     /// Create a new transaction.
     pub fn init(allocator: Allocator, opts: TransactionOpts) Transaction {
-        const trace_uuid = Uuid.v4();
         const event_uuid = Uuid.v4();
         return Transaction{
             .event_id = event_uuid.toHex(),
-            .trace_id = trace_uuid.toHex(),
+            .trace_id = opts.parent_trace_id orelse Uuid.v4().toHex(),
             .span_id = generateSpanId(),
+            .parent_span_id = opts.parent_span_id,
             .name = opts.name,
             .op = opts.op,
             .description = opts.description,
@@ -140,6 +145,7 @@ pub const Transaction = struct {
             .allocator = allocator,
             .sampled = opts.sampled,
             .sample_rate = opts.sample_rate,
+            .parent_sampled = opts.parent_sampled,
             .release = opts.release,
             .environment = opts.environment,
         };
@@ -210,6 +216,11 @@ pub const Transaction = struct {
         try w.writeAll("\",\"span_id\":\"");
         try w.writeAll(&self.span_id);
         try w.writeByte('"');
+        if (self.parent_span_id) |parent_span_id| {
+            try w.writeAll(",\"parent_span_id\":\"");
+            try w.writeAll(&parent_span_id);
+            try w.writeByte('"');
+        }
         if (self.op) |op| {
             try w.writeAll(",\"op\":");
             try json.Stringify.value(op, .{}, w);
@@ -335,6 +346,24 @@ test "Transaction.startChild creates span with matching trace_id and parent_span
 
     // Child should have its own span_id
     try testing.expect(!std.mem.eql(u8, &txn.span_id, &child.span_id));
+}
+
+test "Transaction.init supports parent trace context" {
+    const parent_trace_id: [32]u8 = "0123456789abcdef0123456789abcdef".*;
+    const parent_span_id: SpanId = "89abcdef01234567".*;
+
+    var txn = Transaction.init(testing.allocator, .{
+        .name = "GET /continued",
+        .parent_trace_id = parent_trace_id,
+        .parent_span_id = parent_span_id,
+        .parent_sampled = true,
+    });
+    defer txn.deinit();
+
+    try testing.expectEqualSlices(u8, &parent_trace_id, &txn.trace_id);
+    try testing.expect(txn.parent_span_id != null);
+    try testing.expectEqualSlices(u8, &parent_span_id, &txn.parent_span_id.?);
+    try testing.expectEqual(@as(?bool, true), txn.parent_sampled);
 }
 
 test "Transaction.startChild keeps span pointers stable across growth" {

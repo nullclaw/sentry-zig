@@ -85,7 +85,7 @@ pub const Hub = struct {
     }
 
     /// Configure current scope by applying callback on a staged copy and
-    /// committing atomically, mirroring Rust SDK configure_scope semantics.
+    /// committing atomically.
     pub fn configureScope(self: *Hub, callback: *const fn (*Scope) void) void {
         self.tryConfigureScope(callback) catch {};
     }
@@ -264,8 +264,37 @@ pub const Hub = struct {
         return self.client.startTransaction(opts);
     }
 
+    pub fn startTransactionFromSentryTrace(
+        self: *Hub,
+        opts: TransactionOpts,
+        sentry_trace_header: []const u8,
+    ) !Transaction {
+        return self.client.startTransactionFromSentryTrace(opts, sentry_trace_header);
+    }
+
+    pub fn startTransactionFromPropagationHeaders(
+        self: *Hub,
+        opts: TransactionOpts,
+        sentry_trace_header: ?[]const u8,
+        baggage_header: ?[]const u8,
+    ) !Transaction {
+        return self.client.startTransactionFromPropagationHeaders(
+            opts,
+            sentry_trace_header,
+            baggage_header,
+        );
+    }
+
     pub fn finishTransaction(self: *Hub, txn: *Transaction) void {
         self.client.finishTransaction(txn);
+    }
+
+    pub fn sentryTraceHeader(self: *Hub, txn: *const Transaction, allocator: Allocator) ![]u8 {
+        return self.client.sentryTraceHeader(txn, allocator);
+    }
+
+    pub fn baggageHeader(self: *Hub, txn: *const Transaction, allocator: Allocator) ![]u8 {
+        return self.client.baggageHeader(txn, allocator);
     }
 
     pub fn startSession(self: *Hub) void {
@@ -426,6 +455,29 @@ test "Hub configureScope applies staged mutation to current scope" {
     try hub.trySetTag("scope", "outer");
     hub.configureScope(configureScopeSetTag);
     try testing.expectEqualStrings("configured", hub.currentScope().tags.get("scope").?);
+}
+
+test "Hub startTransactionFromPropagationHeaders continues upstream trace" {
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var hub = try Hub.init(testing.allocator, client);
+    defer hub.deinit();
+
+    var txn = try hub.startTransactionFromPropagationHeaders(
+        .{ .name = "GET /hub-propagation" },
+        "0123456789abcdef0123456789abcdef-89abcdef01234567-1",
+        null,
+    );
+    defer txn.deinit();
+
+    try testing.expectEqualStrings("0123456789abcdef0123456789abcdef", txn.trace_id[0..]);
+    try testing.expect(txn.parent_span_id != null);
+    try testing.expectEqualStrings("89abcdef01234567", txn.parent_span_id.?[0..]);
 }
 
 test "Hub TLS current set and clear" {

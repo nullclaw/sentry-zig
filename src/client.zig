@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
 const json = std.json;
@@ -19,8 +20,10 @@ const Scope = scope_mod.Scope;
 const Session = @import("session.zig").Session;
 const SessionStatus = @import("session.zig").SessionStatus;
 const Transport = @import("transport.zig").Transport;
+const TransportOptions = @import("transport.zig").Options;
 const Worker = @import("worker.zig").Worker;
 const SendOutcome = @import("worker.zig").SendOutcome;
+const RateLimitCategory = @import("ratelimit.zig").Category;
 const signal_handler = @import("signal_handler.zig");
 const envelope = @import("envelope.zig");
 const MonitorCheckIn = @import("monitor.zig").MonitorCheckIn;
@@ -31,6 +34,8 @@ const Uuid = @import("uuid.zig").Uuid;
 const log_mod = @import("log.zig");
 const LogEntry = log_mod.LogEntry;
 const LogLevel = log_mod.LogLevel;
+const propagation = @import("propagation.zig");
+const DynamicSamplingContext = propagation.DynamicSamplingContext;
 
 pub const SessionMode = enum {
     application,
@@ -44,6 +49,16 @@ pub const TracesSamplingContext = struct {
 };
 
 pub const TracesSampler = *const fn (TracesSamplingContext) f64;
+pub const BeforeSendLog = *const fn (*LogEntry) ?*LogEntry;
+pub const TransportSendFn = *const fn ([]const u8, ?*anyopaque) SendOutcome;
+pub const Integration = struct {
+    setup: *const fn (*Client, ?*anyopaque) void,
+    ctx: ?*anyopaque = null,
+};
+pub const TransportConfig = struct {
+    send_fn: TransportSendFn,
+    ctx: ?*anyopaque = null,
+};
 
 /// Configuration options for the Sentry client.
 pub const Options = struct {
@@ -58,8 +73,19 @@ pub const Options = struct {
     max_breadcrumbs: u32 = 100,
     attach_stacktrace: bool = false,
     send_default_pii: bool = false,
+    in_app_include: ?[]const []const u8 = null,
+    in_app_exclude: ?[]const []const u8 = null,
+    default_integrations: bool = true,
+    integrations: ?[]const Integration = null,
     before_send: ?*const fn (*Event) ?*Event = null, // return same pointer, or null to drop
     before_breadcrumb: ?*const fn (Breadcrumb) ?Breadcrumb = null, // return null to drop
+    before_send_log: ?BeforeSendLog = null, // return same pointer, or null to drop
+    transport: ?TransportConfig = null,
+    http_proxy: ?[]const u8 = null,
+    https_proxy: ?[]const u8 = null,
+    accept_invalid_certs: bool = false,
+    max_request_body_size: ?usize = null,
+    enable_logs: bool = true,
     cache_dir: []const u8 = "/tmp/sentry-zig",
     user_agent: []const u8 = "sentry-zig/0.1.0",
     install_signal_handlers: bool = true,
@@ -92,7 +118,11 @@ pub const Client = struct {
 
         const dsn = Dsn.parse(options.dsn) catch return error.InvalidDsn;
 
-        var transport = try Transport.init(allocator, dsn, options.user_agent);
+        var transport = try Transport.init(allocator, dsn, options.user_agent, TransportOptions{
+            .http_proxy = options.http_proxy,
+            .https_proxy = options.https_proxy,
+            .accept_invalid_certs = options.accept_invalid_certs,
+        });
         errdefer transport.deinit();
 
         var scope = try Scope.init(allocator, options.max_breadcrumbs);
@@ -111,6 +141,12 @@ pub const Client = struct {
             .session = null,
             .last_event_id = null,
         };
+
+        if (options.integrations) |integrations| {
+            for (integrations) |integration| {
+                integration.setup(self, integration.ctx);
+            }
+        }
 
         try self.worker.start();
 
@@ -191,12 +227,13 @@ pub const Client = struct {
         defer self.allocator.free(check_in_json);
 
         const data = self.serializeCheckInEnvelope(check_in_json) catch return;
-        _ = self.worker.submit(data, .any);
+        _ = self.submitEnvelope(data, .any);
     }
 
     /// Capture a structured log item.
     pub fn captureLog(self: *Client, entry: *const LogEntry) void {
         if (!self.isEnabled()) return;
+        if (!self.options.enable_logs) return;
 
         var prepared = entry.*;
         if (prepared.trace_id == null) {
@@ -204,11 +241,21 @@ pub const Client = struct {
             prepared.trace_id = trace_id;
         }
 
+        if (self.options.before_send_log) |before_send_log| {
+            if (before_send_log(&prepared)) |processed| {
+                // For memory safety, callbacks must mutate in place and return
+                // the same pointer (or null to drop the log entry).
+                if (processed != &prepared) return;
+            } else {
+                return;
+            }
+        }
+
         const log_json = prepared.toJson(self.allocator) catch return;
         defer self.allocator.free(log_json);
 
         const data = self.serializeLogEnvelope(log_json) catch return;
-        _ = self.worker.submit(data, .log_item);
+        _ = self.submitEnvelope(data, .log_item);
     }
 
     /// Capture a simple structured log message.
@@ -320,7 +367,7 @@ pub const Client = struct {
 
         // Envelope contains an error event item (and optionally attachments),
         // so it must obey error-category rate limits.
-        if (self.worker.submit(data, .@"error") == .dropped_shutdown) {
+        if (!self.submitEnvelope(data, .@"error")) {
             return null;
         }
 
@@ -485,12 +532,15 @@ pub const Client = struct {
                 const sampled_rate = sampler(.{
                     .transaction_name = real_opts.name,
                     .transaction_op = real_opts.op,
-                    .parent_sampled = null,
+                    .parent_sampled = real_opts.parent_sampled,
                 });
                 break :blk if (isValidSampleRate(sampled_rate)) sampled_rate else 0.0;
             }
 
             if (real_opts.sample_rate == 1.0) {
+                if (real_opts.parent_sampled) |parent_sampled| {
+                    break :blk if (parent_sampled) 1.0 else 0.0;
+                }
                 break :blk self.options.traces_sample_rate;
             }
 
@@ -510,6 +560,74 @@ pub const Client = struct {
         return Transaction.init(self.allocator, real_opts);
     }
 
+    /// Start a transaction using upstream `sentry-trace` header context.
+    pub fn startTransactionFromSentryTrace(
+        self: *Client,
+        opts: TransactionOpts,
+        sentry_trace_header: []const u8,
+    ) !Transaction {
+        const parsed = propagation.parseSentryTrace(sentry_trace_header) orelse return error.InvalidSentryTrace;
+
+        var real_opts = opts;
+        real_opts.parent_trace_id = parsed.trace_id;
+        real_opts.parent_span_id = parsed.span_id;
+        real_opts.parent_sampled = parsed.sampled;
+        return self.startTransaction(real_opts);
+    }
+
+    /// Start a transaction using propagation headers (`sentry-trace` and optional `baggage`).
+    pub fn startTransactionFromPropagationHeaders(
+        self: *Client,
+        opts: TransactionOpts,
+        sentry_trace_header: ?[]const u8,
+        baggage_header: ?[]const u8,
+    ) !Transaction {
+        var real_opts = opts;
+
+        if (sentry_trace_header) |trace_header| {
+            const parsed_trace = propagation.parseSentryTrace(trace_header) orelse return error.InvalidSentryTrace;
+            real_opts.parent_trace_id = parsed_trace.trace_id;
+            real_opts.parent_span_id = parsed_trace.span_id;
+            real_opts.parent_sampled = parsed_trace.sampled;
+        }
+
+        if (baggage_header) |baggage| {
+            const parsed_baggage = propagation.parseBaggage(baggage);
+            if (real_opts.parent_trace_id == null and parsed_baggage.trace_id != null) {
+                real_opts.parent_trace_id = parsed_baggage.trace_id;
+            }
+            if (real_opts.parent_sampled == null and parsed_baggage.sampled != null) {
+                real_opts.parent_sampled = parsed_baggage.sampled;
+            }
+        }
+
+        return self.startTransaction(real_opts);
+    }
+
+    /// Build `sentry-trace` header value for an outgoing downstream request.
+    pub fn sentryTraceHeader(self: *const Client, txn: *const Transaction, allocator: Allocator) ![]u8 {
+        _ = self;
+        return propagation.formatSentryTraceAlloc(allocator, .{
+            .trace_id = txn.trace_id,
+            .span_id = txn.span_id,
+            .sampled = txn.sampled,
+        });
+    }
+
+    /// Build `baggage` header value for an outgoing downstream request.
+    pub fn baggageHeader(self: *const Client, txn: *const Transaction, allocator: Allocator) ![]u8 {
+        const dsc: DynamicSamplingContext = .{
+            .trace_id = txn.trace_id,
+            .public_key = self.dsn.public_key,
+            .release = txn.release,
+            .environment = txn.environment,
+            .transaction = txn.name,
+            .sample_rate = txn.sample_rate,
+            .sampled = txn.sampled,
+        };
+        return propagation.formatBaggageAlloc(allocator, dsc);
+    }
+
     /// Finish a transaction, serialize it, and submit the envelope to the worker.
     pub fn finishTransaction(self: *Client, txn: *Transaction) void {
         if (!self.isEnabled()) return;
@@ -525,7 +643,7 @@ pub const Client = struct {
         // Create transaction envelope
         const data = self.serializeTransactionEnvelope(txn, txn_json) catch return;
 
-        _ = self.worker.submit(data, .transaction);
+        _ = self.submitEnvelope(data, .transaction);
     }
 
     // ─── Session Methods ─────────────────────────────────────────────────
@@ -631,6 +749,16 @@ pub const Client = struct {
     fn buildDefaultTraceContexts(allocator: Allocator) !json.Value {
         const trace_id = Uuid.v4().toHex();
         const span_id = txn_mod.generateSpanId();
+        var runtime_version_buf: [64]u8 = undefined;
+        const runtime_version = try std.fmt.bufPrint(
+            &runtime_version_buf,
+            "{d}.{d}.{d}",
+            .{
+                builtin.zig_version.major,
+                builtin.zig_version.minor,
+                builtin.zig_version.patch,
+            },
+        );
 
         var trace_object = json.ObjectMap.init(allocator);
         var trace_moved = false;
@@ -644,6 +772,24 @@ pub const Client = struct {
         try putOwnedString(allocator, &trace_object, "span_id", &span_id);
         try putOwnedBool(allocator, &trace_object, "sampled", false);
 
+        var runtime_object = json.ObjectMap.init(allocator);
+        var runtime_moved = false;
+        errdefer if (!runtime_moved) {
+            var value: json.Value = .{ .object = runtime_object };
+            scope_mod.deinitJsonValueDeep(allocator, &value);
+        };
+        try putOwnedString(allocator, &runtime_object, "name", "zig");
+        try putOwnedString(allocator, &runtime_object, "version", runtime_version);
+
+        var os_object = json.ObjectMap.init(allocator);
+        var os_moved = false;
+        errdefer if (!os_moved) {
+            var value: json.Value = .{ .object = os_object };
+            scope_mod.deinitJsonValueDeep(allocator, &value);
+        };
+        try putOwnedString(allocator, &os_object, "name", @tagName(builtin.os.tag));
+        try putOwnedString(allocator, &os_object, "arch", @tagName(builtin.cpu.arch));
+
         var contexts_object = json.ObjectMap.init(allocator);
         errdefer {
             var value: json.Value = .{ .object = contexts_object };
@@ -652,6 +798,10 @@ pub const Client = struct {
 
         try putOwnedJsonEntry(allocator, &contexts_object, "trace", .{ .object = trace_object });
         trace_moved = true;
+        try putOwnedJsonEntry(allocator, &contexts_object, "runtime", .{ .object = runtime_object });
+        runtime_moved = true;
+        try putOwnedJsonEntry(allocator, &contexts_object, "os", .{ .object = os_object });
+        os_moved = true;
         return .{ .object = contexts_object };
     }
 
@@ -727,6 +877,9 @@ pub const Client = struct {
     fn transportSendCallback(data: []const u8, ctx: ?*anyopaque) SendOutcome {
         if (ctx) |ptr| {
             const client: *Client = @ptrCast(@alignCast(ptr));
+            if (client.options.transport) |custom_transport| {
+                return custom_transport.send_fn(data, custom_transport.ctx);
+            }
             const send_result = client.transport.send(data) catch return .{};
             return .{ .rate_limits = send_result.rate_limits };
         }
@@ -820,7 +973,7 @@ pub const Client = struct {
             return false;
         };
 
-        if (self.worker.submit(data, .session) == .dropped_shutdown) {
+        if (!self.submitEnvelope(data, .session)) {
             return false;
         }
 
@@ -831,6 +984,16 @@ pub const Client = struct {
     fn isValidSampleRate(rate: f64) bool {
         if (!std.math.isFinite(rate)) return false;
         return rate >= 0.0 and rate <= 1.0;
+    }
+
+    fn submitEnvelope(self: *Client, data: []u8, category: RateLimitCategory) bool {
+        if (self.options.max_request_body_size) |max_size| {
+            if (data.len > max_size) {
+                self.allocator.free(data);
+                return false;
+            }
+        }
+        return self.worker.submit(data, category) == .accepted;
     }
 };
 
@@ -847,11 +1010,22 @@ test "Options struct has correct defaults" {
     try testing.expectEqual(@as(u32, 100), opts.max_breadcrumbs);
     try testing.expect(!opts.attach_stacktrace);
     try testing.expect(!opts.send_default_pii);
+    try testing.expect(opts.in_app_include == null);
+    try testing.expect(opts.in_app_exclude == null);
+    try testing.expect(opts.default_integrations);
+    try testing.expect(opts.integrations == null);
     try testing.expect(opts.release == null);
     try testing.expect(opts.environment == null);
     try testing.expect(opts.server_name == null);
     try testing.expect(opts.before_send == null);
     try testing.expect(opts.before_breadcrumb == null);
+    try testing.expect(opts.before_send_log == null);
+    try testing.expect(opts.transport == null);
+    try testing.expect(opts.http_proxy == null);
+    try testing.expect(opts.https_proxy == null);
+    try testing.expect(!opts.accept_invalid_certs);
+    try testing.expect(opts.max_request_body_size == null);
+    try testing.expect(opts.enable_logs);
     try testing.expectEqualStrings("sentry-zig/0.1.0", opts.user_agent);
     try testing.expect(opts.install_signal_handlers);
     try testing.expect(!opts.auto_session_tracking);
@@ -868,17 +1042,43 @@ test "Options struct size is non-zero" {
     try testing.expect(@sizeOf(Options) > 0);
 }
 
+test "Client runs configured integration setup callbacks on init" {
+    var called = false;
+    const integration = Integration{
+        .setup = testIntegrationSetup,
+        .ctx = &called,
+    };
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .integrations = &.{integration},
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    try testing.expect(called);
+}
+
 fn dropBreadcrumb(_: Breadcrumb) ?Breadcrumb {
     return null;
 }
 
 var replacement_event_for_test: Event = undefined;
+var replacement_log_for_test: LogEntry = undefined;
 
 fn replaceEventPointer(_: *Event) ?*Event {
     return &replacement_event_for_test;
 }
 
+fn replaceLogPointer(_: *LogEntry) ?*LogEntry {
+    return &replacement_log_for_test;
+}
+
 fn dropEventBeforeSend(_: *Event) ?*Event {
+    return null;
+}
+
+fn dropLogBeforeSend(_: *LogEntry) ?*LogEntry {
     return null;
 }
 
@@ -894,10 +1094,35 @@ fn neverSampleTraces(_: TracesSamplingContext) f64 {
     return 0.0;
 }
 
+const CustomTransportState = struct {
+    sent_count: usize = 0,
+};
+
+fn customTransportSendFn(_: []const u8, ctx: ?*anyopaque) SendOutcome {
+    const state: *CustomTransportState = @ptrCast(@alignCast(ctx.?));
+    state.sent_count += 1;
+    return .{};
+}
+
+fn testIntegrationSetup(_: *Client, ctx: ?*anyopaque) void {
+    const called: *bool = @ptrCast(@alignCast(ctx.?));
+    called.* = true;
+}
+
 fn hasTraceContext(event: *const Event) bool {
     if (event.contexts) |contexts| {
         return switch (contexts) {
             .object => |obj| obj.get("trace") != null,
+            else => false,
+        };
+    }
+    return false;
+}
+
+fn hasNamedContext(event: *const Event, name: []const u8) bool {
+    if (event.contexts) |contexts| {
+        return switch (contexts) {
+            .object => |obj| obj.get(name) != null,
             else => false,
         };
     }
@@ -921,10 +1146,14 @@ fn hasThreadStacktrace(event: *const Event) bool {
 }
 
 var before_send_saw_trace_context: bool = false;
+var before_send_saw_runtime_context: bool = false;
+var before_send_saw_os_context: bool = false;
 var before_send_saw_threads: bool = false;
 
 fn inspectTraceContextBeforeSend(event: *Event) ?*Event {
     before_send_saw_trace_context = hasTraceContext(event);
+    before_send_saw_runtime_context = hasNamedContext(event, "runtime");
+    before_send_saw_os_context = hasNamedContext(event, "os");
     return event;
 }
 
@@ -962,6 +1191,8 @@ test "Client clearBreadcrumbs removes previously added breadcrumbs" {
 
 test "Client captureMessage injects default trace context into event" {
     before_send_saw_trace_context = false;
+    before_send_saw_runtime_context = false;
+    before_send_saw_os_context = false;
 
     const client = try Client.init(testing.allocator, .{
         .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
@@ -972,6 +1203,8 @@ test "Client captureMessage injects default trace context into event" {
 
     try testing.expect(client.captureMessageId("trace-context-message", .info) != null);
     try testing.expect(before_send_saw_trace_context);
+    try testing.expect(before_send_saw_runtime_context);
+    try testing.expect(before_send_saw_os_context);
 }
 
 test "Client attach_stacktrace adds synthetic thread stacktrace data" {
@@ -1118,6 +1351,102 @@ test "Client serializeLogEnvelope writes log item type" {
     try testing.expect(std.mem.indexOf(u8, serialized, "\"body\":\"log-entry\"") != null);
 }
 
+test "Client before_send_log drops replacement pointers for memory safety" {
+    replacement_log_for_test = LogEntry.init("replacement", .info);
+
+    var state = CustomTransportState{};
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .before_send_log = replaceLogPointer,
+        .transport = .{
+            .send_fn = customTransportSendFn,
+            .ctx = &state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    client.captureLogMessage("original-log", .warn);
+    _ = client.flush(1000);
+
+    try testing.expectEqual(@as(usize, 0), state.sent_count);
+}
+
+test "Client before_send_log can drop log entries" {
+    var state = CustomTransportState{};
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .before_send_log = dropLogBeforeSend,
+        .transport = .{
+            .send_fn = customTransportSendFn,
+            .ctx = &state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    client.captureLogMessage("drop-log", .debug);
+    _ = client.flush(1000);
+
+    try testing.expectEqual(@as(usize, 0), state.sent_count);
+}
+
+test "Client enable_logs false disables log submissions" {
+    var state = CustomTransportState{};
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .enable_logs = false,
+        .transport = .{
+            .send_fn = customTransportSendFn,
+            .ctx = &state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    client.captureLogMessage("disabled-log", .info);
+    _ = client.flush(1000);
+
+    try testing.expectEqual(@as(usize, 0), state.sent_count);
+}
+
+test "Client max_request_body_size drops oversized envelopes" {
+    var state = CustomTransportState{};
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .max_request_body_size = 1,
+        .transport = .{
+            .send_fn = customTransportSendFn,
+            .ctx = &state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    try testing.expect(client.captureMessageId("too-large", .err) == null);
+    client.captureLogMessage("too-large-log", .err);
+    _ = client.flush(1000);
+
+    try testing.expectEqual(@as(usize, 0), state.sent_count);
+}
+
+test "Client custom transport receives submitted envelopes" {
+    var state = CustomTransportState{};
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .transport = .{
+            .send_fn = customTransportSendFn,
+            .ctx = &state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    try testing.expect(client.captureMessageId("custom-transport", .warning) != null);
+    _ = client.flush(1000);
+    try testing.expectEqual(@as(usize, 1), state.sent_count);
+}
+
 test "Client before_send drops replacement pointers for memory safety" {
     replacement_event_for_test = Event.initMessage("replacement", .warning);
 
@@ -1164,6 +1493,78 @@ test "Client traces_sampler overrides traces_sample_rate" {
 
     try testing.expectEqual(@as(f64, 0.0), never_txn.sample_rate);
     try testing.expect(!never_txn.sampled);
+}
+
+test "Client startTransactionFromSentryTrace continues upstream trace context" {
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var txn = try client.startTransactionFromSentryTrace(
+        .{ .name = "GET /continued" },
+        "0123456789abcdef0123456789abcdef-89abcdef01234567-0",
+    );
+    defer txn.deinit();
+
+    try testing.expectEqualStrings("0123456789abcdef0123456789abcdef", txn.trace_id[0..]);
+    try testing.expect(txn.parent_span_id != null);
+    try testing.expectEqualStrings("89abcdef01234567", txn.parent_span_id.?[0..]);
+    try testing.expectEqual(@as(?bool, false), txn.parent_sampled);
+    try testing.expectEqual(@as(f64, 0.0), txn.sample_rate);
+    try testing.expect(!txn.sampled);
+}
+
+test "Client startTransactionFromPropagationHeaders reads baggage sampled fallback" {
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var txn = try client.startTransactionFromPropagationHeaders(
+        .{ .name = "GET /baggage-only" },
+        null,
+        "sentry-trace_id=fedcba9876543210fedcba9876543210,sentry-sampled=false",
+    );
+    defer txn.deinit();
+
+    try testing.expectEqualStrings("fedcba9876543210fedcba9876543210", txn.trace_id[0..]);
+    try testing.expectEqual(@as(?bool, false), txn.parent_sampled);
+    try testing.expectEqual(@as(f64, 0.0), txn.sample_rate);
+    try testing.expect(!txn.sampled);
+}
+
+test "Client sentryTraceHeader and baggageHeader include expected values" {
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .release = "my-app@1.0.0",
+        .environment = "staging",
+        .traces_sample_rate = 1.0,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var txn = client.startTransaction(.{
+        .name = "POST /checkout",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+
+    const sentry_trace = try client.sentryTraceHeader(&txn, testing.allocator);
+    defer testing.allocator.free(sentry_trace);
+    try testing.expect(std.mem.indexOf(u8, sentry_trace, txn.trace_id[0..]) != null);
+    try testing.expect(std.mem.indexOf(u8, sentry_trace, txn.span_id[0..]) != null);
+
+    const baggage = try client.baggageHeader(&txn, testing.allocator);
+    defer testing.allocator.free(baggage);
+    try testing.expect(std.mem.indexOf(u8, baggage, "sentry-trace_id=") != null);
+    try testing.expect(std.mem.indexOf(u8, baggage, "sentry-public_key=examplePublicKey") != null);
+    try testing.expect(std.mem.indexOf(u8, baggage, "sentry-release=my-app%401.0.0") != null);
+    try testing.expect(std.mem.indexOf(u8, baggage, "sentry-environment=staging") != null);
 }
 
 test "Client captureMessageId stores last event id" {

@@ -778,6 +778,60 @@ test "CJM e2e: error rate limits also block events with attachments" {
     try testing.expect(!relay.containsInAny("second with attachment"));
 }
 
+test "CJM e2e: continued transaction keeps upstream trace identifiers" {
+    var relay = try CaptureRelay.init(testing.allocator, &.{});
+    defer relay.deinit();
+    try relay.start();
+
+    const local_dsn = try makeLocalDsn(testing.allocator, relay.port());
+    defer testing.allocator.free(local_dsn);
+
+    const client = try sentry.init(testing.allocator, .{
+        .dsn = local_dsn,
+        .traces_sample_rate = 1.0,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var txn = try client.startTransactionFromSentryTrace(
+        .{
+            .name = "GET /continued",
+            .op = "http.server",
+        },
+        "0123456789abcdef0123456789abcdef-89abcdef01234567-1",
+    );
+    defer txn.deinit();
+
+    client.finishTransaction(&txn);
+    try testing.expect(client.flush(2000));
+    try testing.expect(relay.waitForAtLeast(1, 2000));
+
+    try testing.expect(relay.containsInAny("\"type\":\"transaction\""));
+    try testing.expect(relay.containsInAny("\"trace_id\":\"0123456789abcdef0123456789abcdef\""));
+    try testing.expect(relay.containsInAny("\"parent_span_id\":\"89abcdef01234567\""));
+}
+
+test "CJM e2e: max_request_body_size drops oversized events" {
+    var relay = try CaptureRelay.init(testing.allocator, &.{});
+    defer relay.deinit();
+    try relay.start();
+
+    const local_dsn = try makeLocalDsn(testing.allocator, relay.port());
+    defer testing.allocator.free(local_dsn);
+
+    const client = try sentry.init(testing.allocator, .{
+        .dsn = local_dsn,
+        .max_request_body_size = 32,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    try testing.expect(client.captureMessageId("this payload is intentionally too large to be submitted", .err) == null);
+    try testing.expect(client.flush(2000));
+
+    try testing.expectEqual(@as(usize, 0), relay.requestCount());
+}
+
 // ─── 9. Timestamp Formatting ────────────────────────────────────────────────
 
 test "Timestamp: now() is reasonable" {
