@@ -691,6 +691,12 @@ pub const Client = struct {
                 break :blk if (override) 1.0 else 0.0;
             }
 
+            // Legacy hard-stop for the historical `sampled=false` option when
+            // no sampler/override is used.
+            if (!real_opts.sampled) {
+                break :blk 0.0;
+            }
+
             if (real_opts.sample_rate == 1.0) {
                 if (sampling_hint) |hint| {
                     break :blk if (hint) 1.0 else 0.0;
@@ -705,13 +711,13 @@ pub const Client = struct {
         };
         real_opts.sample_rate = effective_sample_rate;
 
-        if (real_opts.sampled) {
-            if (effective_sample_rate <= 0.0) {
-                real_opts.sampled = false;
-            } else if (effective_sample_rate < 1.0) {
-                const rand_val = std.crypto.random.float(f64);
-                real_opts.sampled = rand_val < effective_sample_rate;
-            }
+        if (effective_sample_rate <= 0.0) {
+            real_opts.sampled = false;
+        } else if (effective_sample_rate >= 1.0) {
+            real_opts.sampled = true;
+        } else {
+            const rand_val = std.crypto.random.float(f64);
+            real_opts.sampled = rand_val < effective_sample_rate;
         }
 
         return Transaction.init(self.allocator, real_opts);
@@ -3000,6 +3006,47 @@ test "Client captureLogMessage adds release environment and server defaults" {
     try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"server.address\":\"edge-01\"") != null);
 }
 
+test "Client captureLog preserves explicit default log attribute keys" {
+    var state = PayloadTransportState.init(testing.allocator);
+    defer state.deinit();
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .release = "my-app@1.2.3",
+        .environment = "staging",
+        .server_name = "edge-01",
+        .transport = .{
+            .send_fn = payloadTransportSendFn,
+            .ctx = &state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var attrs_object = json.ObjectMap.init(testing.allocator);
+    defer {
+        var attrs_value: json.Value = .{ .object = attrs_object };
+        scope_mod.deinitJsonValueDeep(testing.allocator, &attrs_value);
+    }
+    try Client.putOwnedString(testing.allocator, &attrs_object, "sentry.environment", "custom-env");
+    try Client.putOwnedString(testing.allocator, &attrs_object, "sentry.release", "custom-release");
+    try Client.putOwnedString(testing.allocator, &attrs_object, "server.address", "custom-host");
+
+    var entry = LogEntry.init("log-with-explicit-default-keys", .info);
+    entry.attributes = .{ .object = attrs_object };
+    client.captureLog(&entry);
+    _ = client.flush(1000);
+
+    try testing.expectEqual(@as(usize, 1), state.sent_count);
+    try testing.expect(state.last_payload != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"sentry.environment\":\"custom-env\"") != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"sentry.release\":\"custom-release\"") != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"server.address\":\"custom-host\"") != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"sentry.environment\":\"staging\"") == null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"sentry.release\":\"my-app@1.2.3\"") == null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"server.address\":\"edge-01\"") == null);
+}
+
 test "Client batches logs by max items into fewer envelopes" {
     var state = MultiPayloadTransportState.init(testing.allocator);
     defer state.deinit();
@@ -3404,6 +3451,16 @@ test "Client sampled_override controls sampling when traces_sampler is unset" {
 
     try testing.expectEqual(@as(f64, 0.0), override_beats_explicit_rate.sample_rate);
     try testing.expect(!override_beats_explicit_rate.sampled);
+
+    var override_beats_legacy_sampled_flag = client.startTransaction(.{
+        .name = "GET /override-beats-legacy-sampled-flag",
+        .sampled = false,
+        .sampled_override = true,
+    });
+    defer override_beats_legacy_sampled_flag.deinit();
+
+    try testing.expectEqual(@as(f64, 1.0), override_beats_legacy_sampled_flag.sample_rate);
+    try testing.expect(override_beats_legacy_sampled_flag.sampled);
 }
 
 test "Client sampled_override is passed to traces_sampler hint but sampler decides final" {
