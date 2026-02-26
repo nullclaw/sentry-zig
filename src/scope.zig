@@ -12,7 +12,8 @@ const Attachment = @import("attachment.zig").Attachment;
 const Uuid = @import("uuid.zig").Uuid;
 const ts = @import("timestamp.zig");
 const propagation = @import("propagation.zig");
-const envelope = @import("envelope.zig");
+const sdk_meta = @import("sdk_meta.zig");
+const json_value_mod = @import("json_value.zig");
 const transaction_mod = @import("transaction.zig");
 const TransactionOrSpan = transaction_mod.TransactionOrSpan;
 
@@ -82,26 +83,7 @@ pub fn deinitUserDeep(allocator: Allocator, user: *User) void {
 }
 
 pub fn deinitJsonValueDeep(allocator: Allocator, value: *json.Value) void {
-    switch (value.*) {
-        .number_string => |s| allocator.free(@constCast(s)),
-        .string => |s| allocator.free(@constCast(s)),
-        .array => |*arr| {
-            for (arr.items) |*item| {
-                deinitJsonValueDeep(allocator, item);
-            }
-            arr.deinit();
-        },
-        .object => |*obj| {
-            var it = obj.iterator();
-            while (it.next()) |entry| {
-                allocator.free(@constCast(entry.key_ptr.*));
-                deinitJsonValueDeep(allocator, entry.value_ptr);
-            }
-            obj.deinit();
-        },
-        else => {},
-    }
-    value.* = .null;
+    json_value_mod.deinitJsonValueDeep(allocator, value);
 }
 
 fn deinitJsonObjectDeep(allocator: Allocator, obj: *json.ObjectMap) void {
@@ -157,44 +139,7 @@ fn isDefaultFingerprint(value: ?[]const []const u8) bool {
 }
 
 pub fn cloneJsonValue(allocator: Allocator, value: json.Value) !json.Value {
-    return switch (value) {
-        .null => .null,
-        .bool => |v| .{ .bool = v },
-        .integer => |v| .{ .integer = v },
-        .float => |v| .{ .float = v },
-        .number_string => |v| .{ .number_string = try allocator.dupe(u8, v) },
-        .string => |v| .{ .string = try allocator.dupe(u8, v) },
-        .array => |arr| blk: {
-            var copy = json.Array.init(allocator);
-            errdefer {
-                for (copy.items) |*item| {
-                    deinitJsonValueDeep(allocator, item);
-                }
-                copy.deinit();
-            }
-
-            for (arr.items) |item| {
-                try copy.append(try cloneJsonValue(allocator, item));
-            }
-            break :blk .{ .array = copy };
-        },
-        .object => |obj| blk: {
-            var copy = json.ObjectMap.init(allocator);
-            errdefer deinitJsonObjectDeep(allocator, &copy);
-
-            var it = obj.iterator();
-            while (it.next()) |entry| {
-                const key_copy = try allocator.dupe(u8, entry.key_ptr.*);
-                errdefer allocator.free(key_copy);
-
-                var value_copy = try cloneJsonValue(allocator, entry.value_ptr.*);
-                errdefer deinitJsonValueDeep(allocator, &value_copy);
-
-                try copy.put(key_copy, value_copy);
-            }
-            break :blk .{ .object = copy };
-        },
-    };
+    return json_value_mod.cloneJsonValue(allocator, value);
 }
 
 fn cloneBreadcrumb(allocator: Allocator, crumb: Breadcrumb) !Breadcrumb {
@@ -389,6 +334,18 @@ pub const Scope = struct {
     event_processors: std.ArrayListUnmanaged(EventProcessor) = .{},
     breadcrumbs: BreadcrumbBuffer,
     mutex: std.Thread.Mutex = .{},
+
+    const LogEnrichmentSnapshot = struct {
+        propagation_context: PropagationContext,
+        user: ?User = null,
+
+        fn deinit(self: *LogEnrichmentSnapshot, allocator: Allocator) void {
+            if (self.user) |*user| {
+                deinitUserDeep(allocator, user);
+                self.user = null;
+            }
+        }
+    };
 
     pub fn init(allocator: Allocator, max_breadcrumbs: usize) !Scope {
         return Scope{
@@ -601,14 +558,7 @@ pub const Scope = struct {
     pub fn getPropagationContext(self: *Scope) PropagationContext {
         self.mutex.lock();
         defer self.mutex.unlock();
-        if (self.active_span) |source| {
-            const trace_context = source.getTraceContext();
-            return .{
-                .trace_id = trace_context.trace_id,
-                .span_id = trace_context.span_id,
-            };
-        }
-        return self.active_span_context orelse self.propagation_context;
+        return self.effectivePropagationContextLocked();
     }
 
     /// Build `sentry-trace` header from scope propagation context.
@@ -898,17 +848,16 @@ pub const Scope = struct {
     /// Apply scope data to a structured log.
     /// Returns newly allocated attributes object owned by the caller.
     pub fn applyToLog(self: *Scope, allocator: Allocator, log_entry: anytype) !json.Value {
+        var snapshot = try self.snapshotLogEnrichment(allocator);
+        defer snapshot.deinit(allocator);
+
         var attributes_object = json.ObjectMap.init(allocator);
         errdefer {
             var owned: json.Value = .{ .object = attributes_object };
             deinitJsonValueDeep(allocator, &owned);
         }
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        const propagation_context = self.active_span_context orelse self.propagation_context;
-        log_entry.trace_id = propagation_context.trace_id;
+        log_entry.trace_id = snapshot.propagation_context.trace_id;
 
         if (log_entry.attributes) |value| {
             if (value == .object) {
@@ -916,16 +865,16 @@ pub const Scope = struct {
             }
         }
 
-        try putOwnedStringIfMissing(allocator, &attributes_object, "sentry.sdk.name", envelope.SDK_NAME);
-        try putOwnedStringIfMissing(allocator, &attributes_object, "sentry.sdk.version", envelope.SDK_VERSION);
+        try putOwnedStringIfMissing(allocator, &attributes_object, "sentry.sdk.name", sdk_meta.NAME);
+        try putOwnedStringIfMissing(allocator, &attributes_object, "sentry.sdk.version", sdk_meta.VERSION);
         try putOwnedStringIfMissing(
             allocator,
             &attributes_object,
             "parent_span_id",
-            propagation_context.span_id[0..],
+            snapshot.propagation_context.span_id[0..],
         );
 
-        if (self.user) |user| {
+        if (snapshot.user) |user| {
             if (user.id) |id| {
                 try putOwnedStringIfMissing(allocator, &attributes_object, "user.id", id);
             }
@@ -1179,6 +1128,31 @@ pub const Scope = struct {
             self.allocator.free(@constCast(item));
         }
         self.fingerprint.clearRetainingCapacity();
+    }
+
+    fn effectivePropagationContextLocked(self: *Scope) PropagationContext {
+        if (self.active_span) |source| {
+            const trace_context = source.getTraceContext();
+            return .{
+                .trace_id = trace_context.trace_id,
+                .span_id = trace_context.span_id,
+            };
+        }
+        return self.active_span_context orelse self.propagation_context;
+    }
+
+    fn snapshotLogEnrichment(self: *Scope, allocator: Allocator) !LogEnrichmentSnapshot {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var snapshot: LogEnrichmentSnapshot = .{
+            .propagation_context = self.effectivePropagationContextLocked(),
+            .user = null,
+        };
+        if (self.user) |user| {
+            snapshot.user = try cloneUser(allocator, user);
+        }
+        return snapshot;
     }
 };
 
@@ -1543,8 +1517,8 @@ test "Scope applyToLog enriches log trace and attributes" {
 
     const enriched = probe.attributes.?.object;
     try testing.expectEqualStrings("value", enriched.get("existing").?.string);
-    try testing.expectEqualStrings(envelope.SDK_NAME, enriched.get("sentry.sdk.name").?.string);
-    try testing.expectEqualStrings(envelope.SDK_VERSION, enriched.get("sentry.sdk.version").?.string);
+    try testing.expectEqualStrings(sdk_meta.NAME, enriched.get("sentry.sdk.name").?.string);
+    try testing.expectEqualStrings(sdk_meta.VERSION, enriched.get("sentry.sdk.version").?.string);
     try testing.expectEqualStrings(span_id[0..], enriched.get("parent_span_id").?.string);
     try testing.expectEqualStrings("user-123", enriched.get("user.id").?.string);
     try testing.expectEqualStrings("alice", enriched.get("user.name").?.string);

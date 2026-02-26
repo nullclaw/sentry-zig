@@ -8,9 +8,10 @@ const Dsn = @import("dsn.zig").Dsn;
 const Event = @import("event.zig").Event;
 const Attachment = @import("attachment.zig").Attachment;
 const ts = @import("timestamp.zig");
+const sdk_meta = @import("sdk_meta.zig");
 
-pub const SDK_NAME = "sentry-zig";
-pub const SDK_VERSION = "0.1.0";
+pub const SDK_NAME = sdk_meta.NAME;
+pub const SDK_VERSION = sdk_meta.VERSION;
 
 pub const TraceHeader = struct {
     trace_id: [32]u8,
