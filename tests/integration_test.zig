@@ -709,6 +709,53 @@ test "CJM e2e: transaction start timestamp can be set explicitly" {
     try testing.expect(relay.containsInAny("\"start_timestamp\":1704067200.125"));
 }
 
+test "CJM e2e: transaction metadata setters serialize trace data tags and extras" {
+    var relay = try CaptureRelay.init(testing.allocator, &.{});
+    defer relay.deinit();
+    try relay.start();
+
+    const local_dsn = try makeLocalDsn(testing.allocator, relay.port());
+    defer testing.allocator.free(local_dsn);
+
+    const client = try sentry.init(testing.allocator, .{
+        .dsn = local_dsn,
+        .traces_sample_rate = 1.0,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var txn = client.startTransaction(.{
+        .name = "POST /checkout-meta",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+
+    try txn.setTag("flow", "checkout");
+    try txn.setExtra("attempt", .{ .integer = 2 });
+    try txn.setData("cache_hit", .{ .bool = true });
+    try txn.setOrigin("auto.http");
+
+    const child = try txn.startChild(.{
+        .op = "db.query",
+        .description = "INSERT INTO orders",
+    });
+    try child.setTag("db.system", "postgresql");
+    try child.setData("rows", .{ .integer = 1 });
+    child.finish();
+
+    client.finishTransaction(&txn);
+    try testing.expect(client.flush(2000));
+    try testing.expect(relay.waitForAtLeast(1, 2000));
+
+    try testing.expect(relay.containsInAny("\"type\":\"transaction\""));
+    try testing.expect(relay.containsInAny("\"origin\":\"auto.http\""));
+    try testing.expect(relay.containsInAny("\"flow\":\"checkout\""));
+    try testing.expect(relay.containsInAny("\"attempt\":2"));
+    try testing.expect(relay.containsInAny("\"cache_hit\":true"));
+    try testing.expect(relay.containsInAny("\"db.system\":\"postgresql\""));
+    try testing.expect(relay.containsInAny("\"rows\":1"));
+}
+
 test "CJM e2e: before_send_transaction can drop transactions" {
     var relay = try CaptureRelay.init(testing.allocator, &.{});
     defer relay.deinit();

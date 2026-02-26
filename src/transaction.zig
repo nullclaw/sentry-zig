@@ -4,6 +4,7 @@ const testing = std.testing;
 const json = std.json;
 const Writer = std.io.Writer;
 
+const scope_mod = @import("scope.zig");
 const Uuid = @import("uuid.zig").Uuid;
 const ts = @import("timestamp.zig");
 
@@ -99,6 +100,10 @@ pub const Span = struct {
     start_timestamp: f64,
     timestamp: ?f64 = null,
     status: ?SpanStatus = null,
+    tags: std.StringHashMap([]const u8),
+    data: std.StringHashMap(json.Value),
+    sampled: bool = true,
+    allocator: Allocator,
 
     /// Finish the span, setting timestamp and defaulting status to ok.
     pub fn finish(self: *Span) void {
@@ -117,6 +122,36 @@ pub const Span = struct {
     pub fn setStatus(self: *Span, status: SpanStatus) void {
         self.status = status;
     }
+
+    pub fn setOp(self: *Span, op: ?[]const u8) void {
+        self.op = op;
+    }
+
+    pub fn setName(self: *Span, name: ?[]const u8) void {
+        self.description = name;
+    }
+
+    pub fn getStatus(self: *const Span) ?SpanStatus {
+        return self.status;
+    }
+
+    pub fn isSampled(self: *const Span) bool {
+        return self.sampled;
+    }
+
+    pub fn setTag(self: *Span, key: []const u8, value: []const u8) !void {
+        try setTagMapEntry(self.allocator, &self.tags, key, value);
+    }
+
+    pub fn setData(self: *Span, key: []const u8, value: json.Value) !void {
+        try setJsonMapEntry(self.allocator, &self.data, key, value);
+    }
+
+    pub fn deinit(self: *Span) void {
+        deinitTagMapOwned(self.allocator, &self.tags);
+        deinitJsonMapOwned(self.allocator, &self.data);
+        self.* = undefined;
+    }
 };
 
 /// A distributed tracing transaction.
@@ -132,6 +167,10 @@ pub const Transaction = struct {
     timestamp: ?f64 = null,
     status: ?SpanStatus = null,
     spans: std.ArrayList(*Span) = .{},
+    tags: std.StringHashMap([]const u8),
+    extra: std.StringHashMap(json.Value),
+    trace_data: std.StringHashMap(json.Value),
+    origin: ?[]u8 = null,
     allocator: Allocator,
     sampled: bool = true,
     sample_rate: f64 = 1.0,
@@ -153,6 +192,9 @@ pub const Transaction = struct {
             .op = opts.op,
             .description = opts.description,
             .start_timestamp = opts.start_timestamp orelse ts.now(),
+            .tags = std.StringHashMap([]const u8).init(allocator),
+            .extra = std.StringHashMap(json.Value).init(allocator),
+            .trace_data = std.StringHashMap(json.Value).init(allocator),
             .allocator = allocator,
             .sampled = opts.sampled,
             .sample_rate = opts.sample_rate,
@@ -168,10 +210,17 @@ pub const Transaction = struct {
         if (self.incoming_baggage) |value| {
             self.allocator.free(value);
         }
+        if (self.origin) |value| {
+            self.allocator.free(value);
+        }
         for (self.spans.items) |span| {
+            span.deinit();
             self.allocator.destroy(span);
         }
         self.spans.deinit(self.allocator);
+        deinitTagMapOwned(self.allocator, &self.tags);
+        deinitJsonMapOwned(self.allocator, &self.extra);
+        deinitJsonMapOwned(self.allocator, &self.trace_data);
     }
 
     /// Create a child span with the same trace_id and this transaction's span_id as parent.
@@ -200,6 +249,10 @@ pub const Transaction = struct {
             .op = opts.op,
             .description = opts.description,
             .start_timestamp = start_timestamp,
+            .tags = std.StringHashMap([]const u8).init(self.allocator),
+            .data = std.StringHashMap(json.Value).init(self.allocator),
+            .sampled = self.sampled,
+            .allocator = self.allocator,
         };
 
         try self.spans.append(self.allocator, span);
@@ -222,6 +275,42 @@ pub const Transaction = struct {
     /// Set the transaction status.
     pub fn setStatus(self: *Transaction, status: SpanStatus) void {
         self.status = status;
+    }
+
+    pub fn setOp(self: *Transaction, op: ?[]const u8) void {
+        self.op = op;
+    }
+
+    pub fn setName(self: *Transaction, name: []const u8) void {
+        self.name = name;
+    }
+
+    pub fn getStatus(self: *const Transaction) ?SpanStatus {
+        return self.status;
+    }
+
+    pub fn isSampled(self: *const Transaction) bool {
+        return self.sampled;
+    }
+
+    pub fn setTag(self: *Transaction, key: []const u8, value: []const u8) !void {
+        try setTagMapEntry(self.allocator, &self.tags, key, value);
+    }
+
+    pub fn setExtra(self: *Transaction, key: []const u8, value: json.Value) !void {
+        try setJsonMapEntry(self.allocator, &self.extra, key, value);
+    }
+
+    pub fn setData(self: *Transaction, key: []const u8, value: json.Value) !void {
+        try setJsonMapEntry(self.allocator, &self.trace_data, key, value);
+    }
+
+    pub fn setOrigin(self: *Transaction, origin: ?[]const u8) !void {
+        const replacement = if (origin) |value| try self.allocator.dupe(u8, value) else null;
+        errdefer if (replacement) |value| self.allocator.free(value);
+
+        if (self.origin) |value| self.allocator.free(value);
+        self.origin = replacement;
     }
 
     /// Serialize the transaction to JSON for envelope payload.
@@ -266,7 +355,25 @@ pub const Transaction = struct {
             try w.writeAll(status.toString());
             try w.writeByte('"');
         }
+        if (self.origin) |origin| {
+            try w.writeAll(",\"origin\":");
+            try json.Stringify.value(origin, .{}, w);
+        }
+        if (self.trace_data.count() > 0) {
+            try w.writeAll(",\"data\":");
+            try writeJsonMapObject(w, self.trace_data);
+        }
         try w.writeAll("}}");
+
+        if (self.tags.count() > 0) {
+            try w.writeAll(",\"tags\":");
+            try writeTagMapObject(w, self.tags);
+        }
+
+        if (self.extra.count() > 0) {
+            try w.writeAll(",\"extra\":");
+            try writeJsonMapObject(w, self.extra);
+        }
 
         if (self.release) |release| {
             try w.writeAll(",\"release\":");
@@ -333,6 +440,101 @@ fn writeSpanJson(w: *Writer, span: *const Span) !void {
         try w.writeByte('"');
     }
 
+    if (span.tags.count() > 0) {
+        try w.writeAll(",\"tags\":");
+        try writeTagMapObject(w, span.tags);
+    }
+
+    if (span.data.count() > 0) {
+        try w.writeAll(",\"data\":");
+        try writeJsonMapObject(w, span.data);
+    }
+
+    try w.writeByte('}');
+}
+
+fn deinitTagMapOwned(allocator: Allocator, map: *std.StringHashMap([]const u8)) void {
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        allocator.free(@constCast(entry.key_ptr.*));
+        allocator.free(@constCast(entry.value_ptr.*));
+    }
+    map.deinit();
+}
+
+fn deinitJsonMapOwned(allocator: Allocator, map: *std.StringHashMap(json.Value)) void {
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        allocator.free(@constCast(entry.key_ptr.*));
+        scope_mod.deinitJsonValueDeep(allocator, entry.value_ptr);
+    }
+    map.deinit();
+}
+
+fn setTagMapEntry(
+    allocator: Allocator,
+    map: *std.StringHashMap([]const u8),
+    key: []const u8,
+    value: []const u8,
+) !void {
+    const key_copy = try allocator.dupe(u8, key);
+    errdefer allocator.free(key_copy);
+    const value_copy = try allocator.dupe(u8, value);
+    errdefer allocator.free(value_copy);
+
+    if (map.fetchRemove(key)) |kv| {
+        allocator.free(@constCast(kv.key));
+        allocator.free(@constCast(kv.value));
+    }
+
+    try map.put(key_copy, value_copy);
+}
+
+fn setJsonMapEntry(
+    allocator: Allocator,
+    map: *std.StringHashMap(json.Value),
+    key: []const u8,
+    value: json.Value,
+) !void {
+    const key_copy = try allocator.dupe(u8, key);
+    errdefer allocator.free(key_copy);
+    var value_copy = try scope_mod.cloneJsonValue(allocator, value);
+    errdefer scope_mod.deinitJsonValueDeep(allocator, &value_copy);
+
+    if (map.fetchRemove(key)) |kv| {
+        allocator.free(@constCast(kv.key));
+        var old = kv.value;
+        scope_mod.deinitJsonValueDeep(allocator, &old);
+    }
+
+    try map.put(key_copy, value_copy);
+}
+
+fn writeTagMapObject(w: *Writer, map: std.StringHashMap([]const u8)) !void {
+    try w.writeByte('{');
+    var first = true;
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        if (!first) try w.writeByte(',');
+        first = false;
+        try json.Stringify.value(entry.key_ptr.*, .{}, w);
+        try w.writeByte(':');
+        try json.Stringify.value(entry.value_ptr.*, .{}, w);
+    }
+    try w.writeByte('}');
+}
+
+fn writeJsonMapObject(w: *Writer, map: std.StringHashMap(json.Value)) !void {
+    try w.writeByte('{');
+    var first = true;
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        if (!first) try w.writeByte(',');
+        first = false;
+        try json.Stringify.value(entry.key_ptr.*, .{}, w);
+        try w.writeByte(':');
+        try json.Stringify.value(entry.value_ptr.*, .{}, w);
+    }
     try w.writeByte('}');
 }
 
@@ -406,6 +608,7 @@ test "Transaction.startChildWithDetails applies explicit id and timestamp" {
     try testing.expectEqual(start_timestamp, child.start_timestamp);
     try testing.expect(child.parent_span_id != null);
     try testing.expectEqualSlices(u8, &txn.span_id, &child.parent_span_id.?);
+    try testing.expect(child.isSampled());
 }
 
 test "Transaction.init supports parent trace context" {
@@ -480,7 +683,11 @@ test "Span.finish sets timestamp and status" {
         .trace_id = Uuid.v4().toHex(),
         .span_id = generateSpanId(),
         .start_timestamp = ts.now(),
+        .tags = std.StringHashMap([]const u8).init(testing.allocator),
+        .data = std.StringHashMap(json.Value).init(testing.allocator),
+        .allocator = testing.allocator,
     };
+    defer span.deinit();
 
     try testing.expect(span.timestamp == null);
     try testing.expect(span.status == null);
@@ -497,7 +704,11 @@ test "Span.finishWithTimestamp sets explicit timestamp and status" {
         .trace_id = Uuid.v4().toHex(),
         .span_id = generateSpanId(),
         .start_timestamp = ts.now(),
+        .tags = std.StringHashMap([]const u8).init(testing.allocator),
+        .data = std.StringHashMap(json.Value).init(testing.allocator),
+        .allocator = testing.allocator,
     };
+    defer span.deinit();
 
     const explicit = 1704067201.250;
     span.finishWithTimestamp(explicit);
@@ -576,4 +787,62 @@ test "Transaction.toJson produces valid JSON with transaction name, op, spans ar
     try testing.expect(std.mem.indexOf(u8, json_str, "\"dist\":\"42\"") != null);
     // Verify environment
     try testing.expect(std.mem.indexOf(u8, json_str, "\"environment\":\"production\"") != null);
+}
+
+test "Transaction metadata setters serialize trace data tags extra and origin" {
+    var txn = Transaction.init(testing.allocator, .{
+        .name = "GET /meta",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+
+    try txn.setTag("flow", "checkout");
+    try txn.setExtra("attempt", .{ .integer = 2 });
+    try txn.setData("cache_hit", .{ .bool = true });
+    try txn.setOrigin("auto.http");
+    txn.setName("GET /meta-renamed");
+    txn.setOp("http.server.renamed");
+    txn.setStatus(.ok);
+    try testing.expectEqual(@as(?SpanStatus, .ok), txn.getStatus());
+    try testing.expect(txn.isSampled());
+
+    txn.finish();
+    const json_str = try txn.toJson(testing.allocator);
+    defer testing.allocator.free(json_str);
+
+    try testing.expect(std.mem.indexOf(u8, json_str, "\"transaction\":\"GET /meta-renamed\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json_str, "\"origin\":\"auto.http\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json_str, "\"tags\":{") != null);
+    try testing.expect(std.mem.indexOf(u8, json_str, "\"flow\":\"checkout\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json_str, "\"extra\":{") != null);
+    try testing.expect(std.mem.indexOf(u8, json_str, "\"attempt\":2") != null);
+    try testing.expect(std.mem.indexOf(u8, json_str, "\"data\":{") != null);
+    try testing.expect(std.mem.indexOf(u8, json_str, "\"cache_hit\":true") != null);
+}
+
+test "Span metadata setters serialize tags and data" {
+    var txn = Transaction.init(testing.allocator, .{
+        .name = "GET /span-meta",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+
+    const child = try txn.startChild(.{ .op = "db.query", .description = "SELECT 1" });
+    try child.setTag("db.system", "postgresql");
+    try child.setData("rows", .{ .integer = 1 });
+    child.setOp("db.query.custom");
+    child.setName("SELECT 1 /* custom */");
+    child.setStatus(.ok);
+    try testing.expectEqual(@as(?SpanStatus, .ok), child.getStatus());
+    try testing.expect(child.isSampled());
+    child.finish();
+
+    txn.finish();
+    const json_str = try txn.toJson(testing.allocator);
+    defer testing.allocator.free(json_str);
+
+    try testing.expect(std.mem.indexOf(u8, json_str, "\"db.system\":\"postgresql\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json_str, "\"rows\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, json_str, "\"op\":\"db.query.custom\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json_str, "\"description\":\"SELECT 1 /* custom */\"") != null);
 }

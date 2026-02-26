@@ -250,12 +250,22 @@ const fixed_span = try timed_txn.startChildWithDetails(
     1704067200.250,
 );
 fixed_span.finishWithTimestamp(1704067200.500);
+try timed_txn.setTag("flow", "checkout");
+try timed_txn.setExtra("attempt", .{ .integer = 2 });
+try timed_txn.setData("cache_hit", .{ .bool = true });
+try timed_txn.setOrigin("auto.http");
+try fixed_span.setTag("db.system", "postgresql");
+try fixed_span.setData("rows", .{ .integer = 1 });
 
 const span = try txn.startChild(.{
     .op = "db.query",
     .description = "INSERT INTO orders",
 });
 span.finish();
+try txn.setTag("flow", "checkout");
+try txn.setExtra("attempt", .{ .integer = 2 });
+try txn.setData("cache_hit", .{ .bool = true });
+try txn.setOrigin("auto.http");
 
 client.finishTransaction(&txn);
 ```
