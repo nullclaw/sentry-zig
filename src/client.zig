@@ -518,6 +518,11 @@ pub const Client = struct {
         self.scope.setSpan(source);
     }
 
+    /// Get currently active span source from scope.
+    pub fn getSpan(self: *Client) ?TransactionOrSpan {
+        return self.scope.getSpan();
+    }
+
     /// Set fingerprint override on scope.
     pub fn setFingerprint(self: *Client, fingerprint: ?[]const []const u8) void {
         self.trySetFingerprint(fingerprint) catch {};
@@ -2094,6 +2099,7 @@ test "Client setSpan propagates trace context to captured events and logs" {
         .span_id = txn.span_id,
     };
     client.setSpan(.{ .transaction = &txn });
+    try testing.expect(client.getSpan() != null);
 
     try testing.expect(client.captureMessageId("event-with-span-trace", .info) != null);
     client.captureLogMessage("log-with-span-trace", .info);
@@ -2128,6 +2134,7 @@ test "Client setSpan null falls back to base scope propagation context" {
     try testing.expect(client.captureMessageId("event-with-active-span", .info) != null);
 
     client.setSpan(null);
+    try testing.expect(client.getSpan() == null);
     try testing.expect(client.captureMessageId("event-after-span-clear", .info) != null);
     try testing.expect(before_send_trace_after_clear_matches_base);
 }

@@ -233,6 +233,11 @@ pub fn setSpan(source: ?TransactionOrSpan) bool {
     return true;
 }
 
+pub fn currentSpan() ?TransactionOrSpan {
+    const hub = Hub.current() orelse return null;
+    return hub.getSpan();
+}
+
 pub fn withScope(callback: *const fn (*Hub) void) bool {
     const hub = Hub.current() orelse return false;
     hub.withScope(callback) catch return false;
@@ -333,6 +338,7 @@ test "global wrappers are safe no-op without current hub" {
         null,
         "sentry-trace_id=fedcba9876543210fedcba9876543210,sentry-sampled=false",
     ) == null);
+    try std.testing.expect(currentSpan() == null);
     try std.testing.expect(!pushScope());
     try std.testing.expect(!popScope());
     try std.testing.expect(!setSpan(null));
@@ -416,12 +422,16 @@ test "global wrappers route through current hub" {
 
     var txn = startTransaction(.{ .name = "GET /global", .op = "http.server" }).?;
     defer txn.deinit();
+    try std.testing.expect(setSpan(.{ .transaction = &txn }));
+    try std.testing.expect(currentSpan() != null);
     const tx_trace_header = sentryTraceHeader(&txn, std.testing.allocator).?;
     defer std.testing.allocator.free(tx_trace_header);
     const tx_baggage = baggageHeader(&txn, std.testing.allocator).?;
     defer std.testing.allocator.free(tx_baggage);
     try std.testing.expect(std.mem.indexOf(u8, tx_trace_header, txn.trace_id[0..]) != null);
     try std.testing.expect(std.mem.indexOf(u8, tx_baggage, "sentry-trace_id=") != null);
+    try std.testing.expect(setSpan(null));
+    try std.testing.expect(currentSpan() == null);
     try std.testing.expect(finishTransaction(&txn));
 
     const explicit_start = 1704067200.125;

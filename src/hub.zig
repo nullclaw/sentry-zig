@@ -195,6 +195,10 @@ pub const Hub = struct {
         self.topScope().setSpan(source);
     }
 
+    pub fn getSpan(self: *Hub) ?TransactionOrSpan {
+        return self.topScope().getSpan();
+    }
+
     pub fn setFingerprint(self: *Hub, fingerprint: ?[]const []const u8) void {
         self.topScope().setFingerprint(fingerprint) catch {};
     }
@@ -833,7 +837,10 @@ test "Hub setSpan propagates trace context to captured logs" {
     defer txn.deinit();
 
     hub.setSpan(.{ .transaction = &txn });
+    try testing.expect(hub.getSpan() != null);
     hub.captureLogMessage("hub-span-log", .info);
+    hub.setSpan(null);
+    try testing.expect(hub.getSpan() == null);
     _ = client.flush(1000);
 
     const expected_trace = try std.fmt.allocPrint(testing.allocator, "\"trace_id\":\"{s}\"", .{txn.trace_id[0..]});
