@@ -244,7 +244,7 @@ pub const Client = struct {
         defer self.allocator.free(check_in_json);
 
         const data = self.serializeCheckInEnvelope(check_in_json) catch return;
-        _ = self.submitEnvelope(data, .any);
+        _ = self.submitEnvelope(data, .check_in);
     }
 
     /// Capture a structured log item.

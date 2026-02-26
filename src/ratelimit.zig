@@ -6,6 +6,7 @@ pub const Category = enum {
     @"error",
     session,
     transaction,
+    check_in,
     attachment,
     log_item,
 };
@@ -15,6 +16,7 @@ pub const Update = struct {
     @"error": ?u64 = null,
     session: ?u64 = null,
     transaction: ?u64 = null,
+    check_in: ?u64 = null,
     attachment: ?u64 = null,
     log_item: ?u64 = null,
 
@@ -23,6 +25,7 @@ pub const Update = struct {
             self.@"error" == null and
             self.session == null and
             self.transaction == null and
+            self.check_in == null and
             self.attachment == null and
             self.log_item == null;
     }
@@ -33,6 +36,7 @@ pub const Update = struct {
             .@"error" => &self.@"error",
             .session => &self.session,
             .transaction => &self.transaction,
+            .check_in => &self.check_in,
             .attachment => &self.attachment,
             .log_item => &self.log_item,
         };
@@ -49,6 +53,7 @@ pub const Update = struct {
         if (other.@"error") |seconds| self.setMax(.@"error", seconds);
         if (other.session) |seconds| self.setMax(.session, seconds);
         if (other.transaction) |seconds| self.setMax(.transaction, seconds);
+        if (other.check_in) |seconds| self.setMax(.check_in, seconds);
         if (other.attachment) |seconds| self.setMax(.attachment, seconds);
         if (other.log_item) |seconds| self.setMax(.log_item, seconds);
     }
@@ -59,6 +64,7 @@ pub const State = struct {
     error_until_ns: ?i128 = null,
     session_until_ns: ?i128 = null,
     transaction_until_ns: ?i128 = null,
+    check_in_until_ns: ?i128 = null,
     attachment_until_ns: ?i128 = null,
     log_item_until_ns: ?i128 = null,
 
@@ -67,6 +73,7 @@ pub const State = struct {
         if (update.@"error") |seconds| applyCategory(self, .@"error", seconds, now_ns);
         if (update.session) |seconds| applyCategory(self, .session, seconds, now_ns);
         if (update.transaction) |seconds| applyCategory(self, .transaction, seconds, now_ns);
+        if (update.check_in) |seconds| applyCategory(self, .check_in, seconds, now_ns);
         if (update.attachment) |seconds| applyCategory(self, .attachment, seconds, now_ns);
         if (update.log_item) |seconds| applyCategory(self, .log_item, seconds, now_ns);
     }
@@ -79,6 +86,7 @@ pub const State = struct {
             .@"error" => &self.error_until_ns,
             .session => &self.session_until_ns,
             .transaction => &self.transaction_until_ns,
+            .check_in => &self.check_in_until_ns,
             .attachment => &self.attachment_until_ns,
             .log_item => &self.log_item_until_ns,
         };
@@ -146,6 +154,8 @@ fn parseCategory(category_raw: []const u8) ?Category {
     if (std.ascii.eqlIgnoreCase(category, "error")) return .@"error";
     if (std.ascii.eqlIgnoreCase(category, "session")) return .session;
     if (std.ascii.eqlIgnoreCase(category, "transaction")) return .transaction;
+    if (std.ascii.eqlIgnoreCase(category, "monitor")) return .check_in;
+    if (std.ascii.eqlIgnoreCase(category, "check_in")) return .check_in;
     if (std.ascii.eqlIgnoreCase(category, "attachment")) return .attachment;
     if (std.ascii.eqlIgnoreCase(category, "log_item")) return .log_item;
     return null;
@@ -157,6 +167,7 @@ fn applyCategory(self: *State, category: Category, seconds: u64, now_ns: i128) v
         .@"error" => &self.error_until_ns,
         .session => &self.session_until_ns,
         .transaction => &self.transaction_until_ns,
+        .check_in => &self.check_in_until_ns,
         .attachment => &self.attachment_until_ns,
         .log_item => &self.log_item_until_ns,
     };
@@ -193,9 +204,10 @@ test "parseRetryAfterHeader rejects invalid values" {
 }
 
 test "parseSentryRateLimitsHeader parses categories and global entries" {
-    const update = parseSentryRateLimitsHeader("120:error:project:reason, 60:session:foo, 240::organization");
+    const update = parseSentryRateLimitsHeader("120:error:project:reason, 60:session:foo, 30:monitor:foo, 240::organization");
     try testing.expectEqual(@as(?u64, 120), update.@"error");
     try testing.expectEqual(@as(?u64, 60), update.session);
+    try testing.expectEqual(@as(?u64, 30), update.check_in);
     try testing.expectEqual(@as(?u64, 240), update.any);
 }
 
@@ -243,6 +255,7 @@ test "rate limit state applies header semantics correctly" {
     try testing.expect(!state.isEnabled(.@"error", now + std.time.ns_per_s));
     try testing.expect(!state.isEnabled(.session, now + std.time.ns_per_s));
     try testing.expect(state.isEnabled(.transaction, now + std.time.ns_per_s));
+    try testing.expect(state.isEnabled(.check_in, now + std.time.ns_per_s));
     try testing.expect(state.isEnabled(.log_item, now + std.time.ns_per_s));
 
     state.applyUpdate(
@@ -256,5 +269,6 @@ test "rate limit state applies header semantics correctly" {
 
     // Empty categories apply a global limit.
     try testing.expect(!state.isEnabled(.transaction, now + std.time.ns_per_s));
+    try testing.expect(!state.isEnabled(.check_in, now + std.time.ns_per_s));
     try testing.expect(!state.isEnabled(.any, now + std.time.ns_per_s));
 }

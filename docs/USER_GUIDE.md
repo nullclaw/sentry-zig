@@ -436,7 +436,7 @@ The worker handles:
 Default behavior:
 - when the queue overflows, the oldest items are dropped;
 - envelopes with `event` (including those with attachments) follow the `error` category rate limit;
-- `session` and `transaction` categories are limited independently.
+- `session`, `transaction`, and `check_in` categories are limited independently.
 
 ## Crash Handling (POSIX)
 

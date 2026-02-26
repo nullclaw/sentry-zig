@@ -787,6 +787,36 @@ test "CJM e2e: error rate limits also block events with attachments" {
     try testing.expect(!relay.containsInAny("second with attachment"));
 }
 
+test "CJM e2e: monitor rate limits block subsequent check-ins" {
+    const response_headers = [_]std.http.Header{
+        .{ .name = "X-Sentry-Rate-Limits", .value = "60:monitor:organization" },
+    };
+    var relay = try CaptureRelay.init(testing.allocator, &response_headers);
+    defer relay.deinit();
+    try relay.start();
+
+    const local_dsn = try makeLocalDsn(testing.allocator, relay.port());
+    defer testing.allocator.free(local_dsn);
+
+    const client = try sentry.init(testing.allocator, .{
+        .dsn = local_dsn,
+        .environment = "production",
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var first = sentry.MonitorCheckIn.init("limited-checkin", .in_progress);
+    client.captureCheckIn(&first);
+
+    var second = sentry.MonitorCheckIn.init("limited-checkin", .ok);
+    client.captureCheckIn(&second);
+
+    try testing.expect(client.flush(2000));
+    try testing.expect(relay.waitForAtLeast(1, 2000));
+    try testing.expectEqual(@as(usize, 1), relay.requestCount());
+    try testing.expect(relay.containsInAny("\"type\":\"check_in\""));
+}
+
 test "CJM e2e: continued transaction keeps upstream trace identifiers" {
     var relay = try CaptureRelay.init(testing.allocator, &.{});
     defer relay.deinit();
