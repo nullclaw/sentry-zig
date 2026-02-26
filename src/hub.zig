@@ -46,6 +46,19 @@ pub const Hub = struct {
         return hub;
     }
 
+    /// Initialize a hub by cloning the top scope from another hub.
+    pub fn initFromTop(allocator: Allocator, source: *Hub, client: ?*Client) !Hub {
+        var hub: Hub = .{
+            .allocator = allocator,
+            .client = client orelse source.client,
+        };
+        errdefer hub.deinit();
+
+        const base = try source.topScope().clone(allocator);
+        try hub.scopes.append(allocator, base);
+        return hub;
+    }
+
     pub fn deinit(self: *Hub) void {
         if (current_hub_tls == self) {
             current_hub_tls = null;
@@ -579,6 +592,69 @@ test "Hub withScope auto pops temporary scope" {
     try hub.trySetTag("scope", "outer");
     try hub.withScope(withScopeMutateTag);
     try testing.expectEqualStrings("outer", hub.currentScope().tags.get("scope").?);
+}
+
+test "Hub initFromTop inherits base scope and isolates child breadcrumbs" {
+    var parent_state = HubPayloadTransportState.init(testing.allocator);
+    defer parent_state.deinit();
+    var child_state = HubPayloadTransportState.init(testing.allocator);
+    defer child_state.deinit();
+
+    const parent_client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .transport = .{
+            .send_fn = hubPayloadTransportSendFn,
+            .ctx = &parent_state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer parent_client.deinit();
+
+    var parent_hub = try Hub.init(testing.allocator, parent_client);
+    defer parent_hub.deinit();
+
+    parent_hub.addBreadcrumb(.{
+        .message = "Starting service...",
+        .level = .info,
+    });
+    _ = parent_hub.captureMessageId("Started service", .info);
+
+    const child_client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .transport = .{
+            .send_fn = hubPayloadTransportSendFn,
+            .ctx = &child_state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer child_client.deinit();
+
+    var child_hub = try Hub.initFromTop(testing.allocator, &parent_hub, child_client);
+    defer child_hub.deinit();
+
+    child_hub.addBreadcrumb(.{
+        .message = "Got request with arg: World",
+        .level = .info,
+    });
+    _ = child_hub.captureMessageId("Request failed", .err);
+
+    _ = parent_client.flush(1000);
+    _ = child_client.flush(1000);
+
+    try testing.expectEqual(@as(usize, 1), parent_state.sent_count);
+    try testing.expect(parent_state.last_payload != null);
+    try testing.expect(std.mem.indexOf(u8, parent_state.last_payload.?, "\"Started service\"") != null);
+    try testing.expect(std.mem.indexOf(u8, parent_state.last_payload.?, "\"Starting service...\"") != null);
+    try testing.expect(std.mem.indexOf(u8, parent_state.last_payload.?, "Got request with arg: World") == null);
+
+    try testing.expectEqual(@as(usize, 1), child_state.sent_count);
+    try testing.expect(child_state.last_payload != null);
+    try testing.expect(std.mem.indexOf(u8, child_state.last_payload.?, "\"Request failed\"") != null);
+    try testing.expect(std.mem.indexOf(u8, child_state.last_payload.?, "\"Starting service...\"") != null);
+    try testing.expect(std.mem.indexOf(u8, child_state.last_payload.?, "\"Got request with arg: World\"") != null);
+
+    // Parent scope must remain unchanged after child hub mutations.
+    try testing.expectEqual(@as(usize, 1), parent_hub.currentScope().breadcrumbs.count);
 }
 
 test "Hub withConfiguredScope applies temporary scope configuration" {

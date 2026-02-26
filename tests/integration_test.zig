@@ -633,6 +633,72 @@ test "CJM e2e: full flow captures event transaction log session and check-in" {
     try testing.expect(relay.containsInAny("\"environment\":\"production\""));
 }
 
+test "Rust parity e2e: event trace context comes from propagation context without active span" {
+    var relay = try CaptureRelay.init(testing.allocator, &.{});
+    defer relay.deinit();
+    try relay.start();
+
+    const local_dsn = try makeLocalDsn(testing.allocator, relay.port());
+    defer testing.allocator.free(local_dsn);
+
+    const client = try sentry.init(testing.allocator, .{
+        .dsn = local_dsn,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    try testing.expect(client.getSpan() == null);
+    client.captureMessage("trace-context-from-propagation", .warning);
+
+    try testing.expect(client.flush(2000));
+    try testing.expect(relay.waitForAtLeast(1, 2000));
+
+    try testing.expect(relay.containsInAny("\"type\":\"event\""));
+    try testing.expect(relay.containsInAny("\"trace-context-from-propagation\""));
+    try testing.expect(relay.containsInAny("\"contexts\":"));
+    try testing.expect(relay.containsInAny("\"trace_id\":\""));
+    try testing.expect(relay.containsInAny("\"span_id\":\""));
+}
+
+test "Rust parity e2e: transaction envelope carries dynamic sampling trace header fields" {
+    var relay = try CaptureRelay.init(testing.allocator, &.{});
+    defer relay.deinit();
+    try relay.start();
+
+    const local_dsn = try makeLocalDsn(testing.allocator, relay.port());
+    defer testing.allocator.free(local_dsn);
+
+    const client = try sentry.init(testing.allocator, .{
+        .dsn = local_dsn,
+        .traces_sample_rate = 1.0,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var txn = client.startTransaction(.{
+        .name = "parity-dsc-header",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+
+    const expected_trace_id = try std.fmt.allocPrint(testing.allocator, "\"trace_id\":\"{s}\"", .{txn.trace_id[0..]});
+    defer testing.allocator.free(expected_trace_id);
+
+    client.setSpan(.{ .transaction = &txn });
+    client.finishTransaction(&txn);
+    client.setSpan(null);
+
+    try testing.expect(client.flush(2000));
+    try testing.expect(relay.waitForAtLeast(1, 2000));
+
+    try testing.expect(relay.containsInAny("\"type\":\"transaction\""));
+    try testing.expect(relay.containsInAny("\"trace\":{"));
+    try testing.expect(relay.containsInAny(expected_trace_id));
+    try testing.expect(relay.containsInAny("\"public_key\":\"testkey\""));
+    try testing.expect(relay.containsInAny("\"sample_rate\":1.000000"));
+    try testing.expect(relay.containsInAny("\"sampled\":true"));
+}
+
 test "CJM e2e: event with scope and attachment reaches relay" {
     var relay = try CaptureRelay.init(testing.allocator, &.{});
     defer relay.deinit();
