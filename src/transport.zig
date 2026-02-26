@@ -110,6 +110,13 @@ pub const Transport = struct {
 
     /// Send envelope data to the Sentry endpoint via HTTP POST.
     pub fn send(self: *Transport, envelope_data: []const u8) !SendResult {
+        if (self.accept_invalid_certs and std.mem.eql(u8, self.envelope_uri.scheme, "https")) {
+            if (self.http_client.https_proxy != null or self.http_client.http_proxy != null) {
+                return error.InsecureTlsWithProxyUnsupported;
+            }
+            return self.sendInsecureTls(envelope_data);
+        }
+
         var req = try self.http_client.request(.POST, self.envelope_uri, .{
             .redirect_behavior = .unhandled,
             .extra_headers = &.{
@@ -157,7 +164,97 @@ pub const Transport = struct {
             .rate_limits = rate_limits,
         };
     }
+
+    fn sendInsecureTls(self: *Transport, envelope_data: []const u8) !SendResult {
+        var host_buf: [std.Uri.host_name_max]u8 = undefined;
+        const host = try self.envelope_uri.getHost(&host_buf);
+        const port = self.envelope_uri.port orelse 443;
+
+        var stream = try std.net.tcpConnectToHost(self.allocator, host, port);
+        defer stream.close();
+
+        var socket_read_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined;
+        var tls_read_buf: [std.crypto.tls.Client.min_buffer_len + 16384]u8 = undefined;
+        var tls_stream_write_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined;
+        var tls_app_write_buf: [16384]u8 = undefined;
+
+        var stream_reader = stream.reader(&socket_read_buf);
+        var stream_writer = stream.writer(&tls_stream_write_buf);
+
+        var tls_client = try std.crypto.tls.Client.init(
+            stream_reader.interface(),
+            &stream_writer.interface,
+            .{
+                .host = .no_verification,
+                .ca = .no_verification,
+                .read_buffer = &tls_read_buf,
+                .write_buffer = &tls_app_write_buf,
+                .allow_truncation_attacks = true,
+            },
+        );
+        defer _ = tls_client.end() catch {};
+
+        const writer = &tls_client.writer;
+        try writer.writeAll("POST ");
+        try self.envelope_uri.writeToStream(writer, .{
+            .path = true,
+            .query = true,
+        });
+        try writer.writeAll(" HTTP/1.1\r\nHost: ");
+        try writer.writeAll(host);
+        if (self.envelope_uri.port != null and port != 443) {
+            try writer.print(":{d}", .{port});
+        }
+        try writer.writeAll("\r\nContent-Type: application/x-sentry-envelope\r\nUser-Agent: ");
+        try writer.writeAll(self.user_agent);
+        try writer.print("\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{envelope_data.len});
+        try writer.writeAll(envelope_data);
+        try writer.flush();
+
+        const reader = &tls_client.reader;
+        const status_line_raw = reader.takeDelimiterExclusive('\n') catch return error.InvalidHttpResponse;
+        const status_line = std.mem.trimRight(u8, status_line_raw, "\r");
+        const status_code = parseHttpStatusCode(status_line) orelse return error.InvalidHttpResponse;
+
+        var rate_limits: RateLimitUpdate = .{};
+        while (true) {
+            const header_line_raw = reader.takeDelimiterExclusive('\n') catch return error.InvalidHttpResponse;
+            const header_line = std.mem.trimRight(u8, header_line_raw, "\r");
+            if (header_line.len == 0) break;
+
+            const colon = std.mem.indexOfScalar(u8, header_line, ':') orelse continue;
+            const name = std.mem.trim(u8, header_line[0..colon], " \t");
+            const value = std.mem.trim(u8, header_line[colon + 1 ..], " \t");
+
+            if (std.ascii.eqlIgnoreCase(name, "retry-after")) {
+                if (ratelimit.parseRetryAfterHeader(value)) |seconds| {
+                    rate_limits.setMax(.any, seconds);
+                }
+            } else if (std.ascii.eqlIgnoreCase(name, "x-sentry-rate-limits")) {
+                rate_limits.merge(ratelimit.parseSentryRateLimitsHeader(value));
+            }
+        }
+
+        _ = reader.discardRemaining() catch {};
+
+        if (rate_limits.isEmpty() and status_code == 429) {
+            rate_limits.setMax(.any, 60);
+        }
+
+        return SendResult{
+            .status_code = status_code,
+            .retry_after = rate_limits.any,
+            .rate_limits = rate_limits,
+        };
+    }
 };
+
+fn parseHttpStatusCode(status_line: []const u8) ?u16 {
+    var parts = std.mem.tokenizeScalar(u8, status_line, ' ');
+    _ = parts.next() orelse return null;
+    const code_text = parts.next() orelse return null;
+    return std.fmt.parseInt(u16, code_text, 10) catch null;
+}
 
 /// MockTransport records sent envelopes for testing purposes.
 pub const MockTransport = struct {
@@ -297,6 +394,17 @@ test "Transport stores accept_invalid_certs option" {
     defer transport.deinit();
 
     try testing.expect(transport.accept_invalid_certs);
+}
+
+test "Transport send rejects insecure TLS mode when proxies are configured" {
+    const dsn = try Dsn.parse("https://examplePublicKey@o0.ingest.sentry.io/1234567");
+    var transport = try Transport.init(testing.allocator, dsn, "sentry-zig/0.1.0", .{
+        .accept_invalid_certs = true,
+        .https_proxy = "http://proxy.local:8080",
+    });
+    defer transport.deinit();
+
+    try testing.expectError(error.InsecureTlsWithProxyUnsupported, transport.send("test"));
 }
 
 test "Transport init fails for invalid proxy URL" {

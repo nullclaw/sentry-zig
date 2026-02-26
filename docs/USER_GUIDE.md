@@ -454,8 +454,11 @@ Configuration:
 - `install_signal_handlers = true|false`
 - `cache_dir` for crash marker files.
 - `http_proxy` / `https_proxy` for explicit proxy URLs.
+- `accept_invalid_certs` to disable TLS certificate verification for direct HTTPS transport in local/dev setups.
 - `transport` for custom envelope sender callback.
 - `max_request_body_size` to drop oversized envelopes.
+
+`accept_invalid_certs=true` is not supported together with explicit proxy transport settings.
 
 ## Production Checklist
 

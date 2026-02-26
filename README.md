@@ -202,13 +202,14 @@ All options are provided via `sentry.Options` in `sentry.init`.
 | `transport` | `?TransportConfig` | `null` | Custom transport callback override |
 | `http_proxy` | `?[]const u8` | `null` | Explicit HTTP proxy URL (fallback to env vars when unset) |
 | `https_proxy` | `?[]const u8` | `null` | Explicit HTTPS proxy URL (fallback to env vars when unset) |
-| `accept_invalid_certs` | `bool` | `false` | Transport TLS policy toggle reserved for advanced setups |
+| `accept_invalid_certs` | `bool` | `false` | Disable TLS certificate verification for direct HTTPS transport (development/testing only) |
 | `max_request_body_size` | `?usize` | `null` | Drop envelopes larger than this byte size |
 | `enable_logs` | `bool` | `true` | Enable/disable structured log submissions |
 
 When `default_integrations = false`, automatic runtime/os context enrichment is disabled
 (trace context bootstrap remains enabled).
 `in_app_include`/`in_app_exclude` are applied to exception stack frames.
+`accept_invalid_certs=true` is intended for local/dev environments and is not supported together with explicit proxy transport.
 
 Example integration setup callback:
 
