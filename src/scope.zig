@@ -13,11 +13,13 @@ const ts = @import("timestamp.zig");
 pub const MAX_BREADCRUMBS = 200;
 
 pub const ApplyResult = struct {
+    level_applied: bool = false,
     user_allocated: bool = false,
     tags_allocated: bool = false,
     extra_allocated: bool = false,
     contexts_allocated: bool = false,
     breadcrumbs_allocated: bool = false,
+    previous_level: ?Level = null,
     previous_tags: ?json.Value = null,
     previous_extra: ?json.Value = null,
     previous_contexts: ?json.Value = null,
@@ -448,9 +450,12 @@ pub const Scope = struct {
         defer self.mutex.unlock();
 
         var result: ApplyResult = .{};
+        errdefer cleanupAppliedToEvent(allocator, event, result);
 
         if (self.level) |level| {
+            result.previous_level = event.level;
             event.level = level;
+            result.level_applied = true;
         }
 
         // Apply user only when event user is not set.
@@ -585,6 +590,10 @@ pub const Scope = struct {
 };
 
 pub fn cleanupAppliedToEvent(allocator: Allocator, event: *Event, result: ApplyResult) void {
+    if (result.level_applied) {
+        event.level = result.previous_level;
+    }
+
     if (result.user_allocated) {
         if (event.user) |*u| {
             deinitUserDeep(allocator, u);
@@ -820,7 +829,35 @@ test "Scope level overrides event level during applyToEvent" {
     event.level = .info;
 
     const applied = try scope.applyToEvent(testing.allocator, &event);
-    defer cleanupAppliedToEvent(testing.allocator, &event, applied);
-
     try testing.expectEqual(Level.fatal, event.level.?);
+
+    cleanupAppliedToEvent(testing.allocator, &event, applied);
+    try testing.expectEqual(Level.info, event.level.?);
+}
+
+test "Scope applyToEvent rolls back mutations on allocation failure" {
+    var scope = try Scope.init(testing.allocator, 10);
+    defer scope.deinit();
+
+    scope.setLevel(.fatal);
+    scope.setUser(.{ .id = "scope-user" });
+    try scope.setTag("scope-tag", "value");
+
+    var event = Event.init();
+    event.level = .info;
+
+    var failing_allocator_state = std.testing.FailingAllocator.init(testing.allocator, .{
+        .fail_index = 0,
+    });
+    const failing_allocator = failing_allocator_state.allocator();
+
+    try testing.expectError(error.OutOfMemory, scope.applyToEvent(failing_allocator, &event));
+
+    // Scope application failed; original event must remain unchanged.
+    try testing.expectEqual(Level.info, event.level.?);
+    try testing.expect(event.user == null);
+    try testing.expect(event.tags == null);
+    try testing.expect(event.extra == null);
+    try testing.expect(event.contexts == null);
+    try testing.expect(event.breadcrumbs == null);
 }

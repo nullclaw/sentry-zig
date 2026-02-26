@@ -9,6 +9,43 @@ pub const SendResult = struct {
     retry_after: ?u64 = null, // seconds to wait before retry
 };
 
+fn parseRetryAfterHeader(header_value: []const u8) ?u64 {
+    const trimmed = std.mem.trim(u8, header_value, " \t");
+    if (trimmed.len == 0) return null;
+
+    if (std.fmt.parseInt(u64, trimmed, 10)) |seconds| {
+        return seconds;
+    } else |_| {}
+
+    if (std.fmt.parseFloat(f64, trimmed)) |seconds_float| {
+        if (!std.math.isFinite(seconds_float) or seconds_float < 0) return null;
+        return @intFromFloat(std.math.ceil(seconds_float));
+    } else |_| {}
+
+    return null;
+}
+
+fn parseSentryRateLimitsHeader(header_value: []const u8) ?u64 {
+    var max_retry_after: ?u64 = null;
+    var groups = std.mem.splitScalar(u8, header_value, ',');
+    while (groups.next()) |group| {
+        const trimmed_group = std.mem.trim(u8, group, " \t");
+        if (trimmed_group.len == 0) continue;
+
+        const sep_idx = std.mem.indexOfScalar(u8, trimmed_group, ':') orelse continue;
+        const seconds_str = trimmed_group[0..sep_idx];
+        const seconds = parseRetryAfterHeader(seconds_str) orelse continue;
+
+        if (max_retry_after) |current| {
+            if (seconds > current) max_retry_after = seconds;
+        } else {
+            max_retry_after = seconds;
+        }
+    }
+
+    return max_retry_after;
+}
+
 /// HTTP Transport for sending serialized envelopes to Sentry via HTTPS POST.
 pub const Transport = struct {
     allocator: Allocator,
@@ -44,20 +81,54 @@ pub const Transport = struct {
 
     /// Send envelope data to the Sentry endpoint via HTTP POST.
     pub fn send(self: *Transport, envelope_data: []const u8) !SendResult {
-        const result = try self.http_client.fetch(.{
-            .location = .{ .url = self.envelope_url },
-            .method = .POST,
-            .payload = envelope_data,
+        const uri = try std.Uri.parse(self.envelope_url);
+        var req = try self.http_client.request(.POST, uri, .{
+            .redirect_behavior = .unhandled,
             .extra_headers = &.{
                 .{ .name = "Content-Type", .value = "application/x-sentry-envelope" },
                 .{ .name = "User-Agent", .value = self.user_agent },
             },
         });
+        defer req.deinit();
 
-        const status_code: u16 = @intFromEnum(result.status);
+        req.transfer_encoding = .{ .content_length = envelope_data.len };
+        var body = try req.sendBodyUnflushed(&.{});
+        try body.writer.writeAll(envelope_data);
+        try body.end();
+        try req.connection.?.flush();
+
+        var response = try req.receiveHead(&.{});
+        const status_code: u16 = @intFromEnum(response.head.status);
 
         var retry_after: ?u64 = null;
-        if (status_code == 429) {
+        var header_it = response.head.iterateHeaders();
+        while (header_it.next()) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, "retry-after")) {
+                if (parseRetryAfterHeader(header.value)) |seconds| {
+                    if (retry_after) |current| {
+                        if (seconds > current) retry_after = seconds;
+                    } else {
+                        retry_after = seconds;
+                    }
+                }
+            } else if (std.ascii.eqlIgnoreCase(header.name, "x-sentry-rate-limits")) {
+                if (parseSentryRateLimitsHeader(header.value)) |seconds| {
+                    if (retry_after) |current| {
+                        if (seconds > current) retry_after = seconds;
+                    } else {
+                        retry_after = seconds;
+                    }
+                }
+            }
+        }
+
+        var transfer_buffer: [256]u8 = undefined;
+        const reader = response.reader(&transfer_buffer);
+        _ = reader.discardRemaining() catch |err| switch (err) {
+            error.ReadFailed => return response.bodyErr().?,
+        };
+
+        if (retry_after == null and status_code == 429) {
             // Default to 60s retry-after for rate-limited responses
             retry_after = 60;
         }
@@ -168,4 +239,21 @@ test "Transport stores custom user agent" {
     defer transport.deinit();
 
     try testing.expectEqualStrings("my-sdk/9.9.9", transport.user_agent);
+}
+
+test "parseRetryAfterHeader parses integer and float values" {
+    try testing.expectEqual(@as(?u64, 60), parseRetryAfterHeader("60"));
+    try testing.expectEqual(@as(?u64, 61), parseRetryAfterHeader("60.1"));
+    try testing.expectEqual(@as(?u64, 0), parseRetryAfterHeader("0"));
+}
+
+test "parseRetryAfterHeader rejects invalid values" {
+    try testing.expectEqual(@as(?u64, null), parseRetryAfterHeader(""));
+    try testing.expectEqual(@as(?u64, null), parseRetryAfterHeader("abc"));
+    try testing.expectEqual(@as(?u64, null), parseRetryAfterHeader("-1"));
+}
+
+test "parseSentryRateLimitsHeader returns max group duration" {
+    const header = "120:error:project:reason, 60:session:foo, 240::organization";
+    try testing.expectEqual(@as(?u64, 240), parseSentryRateLimitsHeader(header));
 }
