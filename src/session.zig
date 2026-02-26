@@ -51,7 +51,7 @@ pub const Session = struct {
         return startWithMode(release, environment, true);
     }
 
-    /// Create a session and optionally disable duration tracking (request mode parity).
+    /// Create a session and optionally disable duration tracking (request mode).
     pub fn startWithMode(release: []const u8, environment: []const u8, track_duration: bool) Session {
         const uuid = Uuid.v4();
         const now = ts.now();

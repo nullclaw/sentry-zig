@@ -1,24 +1,48 @@
 # Sentry-Zig
 
-Pure Zig Sentry SDK -- zero external dependencies. Captures errors, exceptions,
-transactions, and sessions, then delivers them to [Sentry](https://sentry.io)
-via the envelope protocol over HTTPS.
+Native Sentry SDK in Zig (`0.15.x`) for capturing errors, transactions, sessions,
+and monitor check-ins via the Sentry Envelope protocol.
 
-Detailed usage guide: [docs/USER_GUIDE.md](docs/USER_GUIDE.md)
+This repository focuses on a clean public API, production-safe defaults, and
+predictable shutdown behavior.
+
+Detailed guide: [docs/USER_GUIDE.md](docs/USER_GUIDE.md)
+
+## Quickstart
+
+```zig
+const std = @import("std");
+const sentry = @import("sentry-zig");
+
+pub fn main() !void {
+    const allocator = std.heap.page_allocator;
+
+    const client = try sentry.init(allocator, .{
+        .dsn = "https://PUBLIC_KEY@o0.ingest.sentry.io/PROJECT_ID",
+        .release = "my-app@1.0.0",
+        .environment = "production",
+        .traces_sample_rate = 1.0,
+    });
+    defer client.deinit();
+
+    client.captureMessage("Hello from Zig", .info);
+    _ = client.flush(5000);
+}
+```
 
 ## Requirements
 
-- Zig >= 0.15.0
+- Zig `>= 0.15.0`
 
 ## Installation
 
-Add the dependency with `zig fetch`:
+Add dependency:
 
 ```sh
 zig fetch --save git+https://github.com/nullclaw/sentry-zig.git
 ```
 
-Then import the module in your `build.zig`:
+Import module in `build.zig`:
 
 ```zig
 const sentry_dep = b.dependency("sentry-zig", .{
@@ -28,157 +52,103 @@ const sentry_dep = b.dependency("sentry-zig", .{
 exe.root_module.addImport("sentry-zig", sentry_dep.module("sentry-zig"));
 ```
 
-## Usage
+## Core Concepts
+
+- `Client`: owns transport, worker queue, and runtime configuration.
+- `Scope`: mutable event context (user, tags, extras, breadcrumbs, attachments).
+- `Event`: error/message payload (`captureMessage`, `captureException`, `captureEvent`).
+- `Transaction` + `Span`: tracing payloads (`startTransaction`, `finishTransaction`).
+- `Session`: release health lifecycle (`startSession`, `endSession`).
+- `MonitorCheckIn`: cron monitor status payload (`captureCheckIn`).
+
+## Feature Status
+
+| Capability | Status | Notes |
+|---|---|---|
+| Event capture | Implemented | Message/exception/custom event capture, before-send filtering |
+| Scope enrichment | Implemented | User/tags/extras/contexts/breadcrumbs/fingerprint/transaction |
+| Attachments | Implemented | In-memory and file-backed attachments |
+| Transactions & spans | Implemented | Sampling + trace context serialization |
+| Traces sampler callback | Implemented | `traces_sampler` has priority over `traces_sample_rate` |
+| Sessions (application/request mode) | Implemented | Request mode disables duration tracking |
+| Monitor check-ins | Implemented | `check_in` envelopes with env inheritance |
+| Worker + queue draining | Implemented | Bounded queue + `flush`/`close` semantics |
+| Transport rate limits | Implemented | `Retry-After` + `X-Sentry-Rate-Limits` parsing |
+| Signal crash marker flow | Implemented | POSIX marker write/read cycle |
+| Hub/TLS scope stack | Not implemented | Planned area |
+| Extended integrations | Not implemented | Planned area |
+| Structured logs pipeline | Not implemented | Planned area |
+
+## Common Usage
 
 ```zig
-const std = @import("std");
-const sentry = @import("sentry-zig");
+// Capture message
+client.captureMessage("checkout failed", .err);
 
-pub fn main() !void {
-    const allocator = std.heap.page_allocator;
+// Capture exception
+client.captureException("PaymentError", "gateway timeout");
 
-    // Initialize the Sentry client (heap-allocated, returns *Client)
-    const client = try sentry.init(allocator, .{
-        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/0",
-        .release = "my-app@1.0.0",
-        .environment = "production",
-        .traces_sample_rate = 1.0,
-    });
-    defer client.deinit();
-
-    // Set user context
-    client.setUser(.{
-        .id = "user-42",
-        .email = "user@example.com",
-    });
-
-    // Add a breadcrumb
-    client.addBreadcrumb(.{
-        .message = "Application started",
-        .category = "lifecycle",
-        .level = .info,
-    });
-
-    // Capture a message
-    client.captureMessage("Something noteworthy happened", .info);
-
-    // Capture an exception
-    client.captureException("RuntimeError", "division by zero");
-
-    // Attach additional binary/text payloads to upcoming events
-    var attachment = try sentry.Attachment.initOwned(
-        allocator,
-        "debug.txt",
-        "diagnostic payload",
-        "text/plain",
-        "event.attachment",
-    );
-    defer attachment.deinit(allocator);
-    client.addAttachment(attachment);
-
-    // Start a transaction for performance monitoring
-    var txn = client.startTransaction(.{
-        .name = "GET /api/users",
-        .op = "http.server",
-    });
-    defer txn.deinit();
-
-    // Add a child span
-    const span = try txn.startChild(.{
-        .op = "db.query",
-        .description = "SELECT * FROM users",
-    });
-    span.finish();
-
-    // Finish the transaction (serializes and enqueues for sending)
-    client.finishTransaction(&txn);
-
-    // Start a session for release health
-    client.startSession();
-
-    // ... application logic ...
-
-    // End the session
-    client.endSession(.exited);
-
-    // Send a monitor check-in
-    var check_in = sentry.MonitorCheckIn.init("nightly-job", .ok);
-    client.captureCheckIn(&check_in);
-
-    // Flush pending events before shutdown (5 second timeout)
-    _ = client.flush(5000);
+// Get event id when accepted
+if (client.captureMessageId("degraded mode", .warning)) |event_id| {
+    std.log.warn("event_id={s}", .{event_id});
 }
+
+// Scope data
+client.setUser(.{ .id = "user-42", .email = "user@example.com" });
+client.setTag("feature", "checkout");
+client.addBreadcrumb(.{ .category = "http", .message = "POST /checkout", .level = .info });
 ```
-
-## Features
-
-- **Error Capture** -- `captureMessage` and `captureException` with automatic
-  enrichment from the scope (user, tags, breadcrumbs, extras, contexts).
-- **Performance Monitoring** -- Distributed tracing with `Transaction` and `Span`
-  types, including parent-child span relationships and trace context propagation.
-- **Release Health** -- Session tracking with `startSession` / `endSession` and
-  automatic error-counting.
-- **Attachments** -- Attach arbitrary binary/text payloads to captured events.
-- **Cron Monitoring** -- `captureCheckIn` support for monitor check-ins (`check_in` envelopes).
-- **Crash Reporting** -- POSIX signal handlers (SIGSEGV, SIGABRT, SIGBUS, SIGILL,
-  SIGFPE) write crash markers to disk, which are picked up on next startup.
-- **Scope Management** -- Thread-safe scope with user context, tags, extras,
-  contexts, and a ring-buffer breadcrumb store.
-- **Background Worker** -- Events are serialized to the Sentry envelope format
-  and sent asynchronously via a background thread with a bounded queue.
-- **HTTP Transport** -- Envelopes are delivered via `std.http.Client` POST to
-  the Sentry envelope endpoint. `Retry-After` and `X-Sentry-Rate-Limits`
-  headers are parsed, with category-aware backoff in the worker.
-- **Sampling** -- Configurable `sample_rate` for events and `traces_sample_rate`
-  for transactions.
-- **Before-Send Hook** -- Optional `before_send` callback to inspect or drop
-  events before they are enqueued.
-- **Before-Breadcrumb Hook** -- Optional `before_breadcrumb` callback to inspect
-  or drop breadcrumbs before they enter the scope buffer.
-- **Scope Event Processors** -- Per-scope processors can mutate or drop events
-  before final envelope serialization.
-- **Pure Zig** -- No libc, no C dependencies, no allocations outside the
-  standard library allocator you provide.
 
 ## Configuration
 
-All options are set via the `Options` struct passed to `sentry.init`:
+All options are provided via `sentry.Options` in `sentry.init`.
 
-| Option                    | Type                              | Default              | Description                              |
-|---------------------------|-----------------------------------|----------------------|------------------------------------------|
-| `dsn`                     | `[]const u8`                      | (required)           | Sentry DSN string                        |
-| `debug`                   | `bool`                            | `false`              | Enable SDK debug mode flag               |
-| `release`                 | `?[]const u8`                     | `null`               | Release identifier                       |
-| `environment`             | `?[]const u8`                     | `null`               | Environment name                         |
-| `server_name`             | `?[]const u8`                     | `null`               | Server / host name                       |
-| `sample_rate`             | `f64`                             | `1.0`                | Event sample rate (0.0 -- 1.0)           |
-| `traces_sample_rate`      | `f64`                             | `0.0`                | Transaction sample rate (0.0 -- 1.0)     |
-| `traces_sampler`          | `?TracesSampler`                  | `null`               | Per-transaction sampler callback         |
-| `max_breadcrumbs`         | `u32`                             | `100`                | Maximum breadcrumbs kept in scope        |
-| `attach_stacktrace`       | `bool`                            | `false`              | Stacktrace capture flag (reserved)       |
-| `send_default_pii`        | `bool`                            | `false`              | PII capture flag (reserved)              |
-| `before_send`             | `?*const fn (*Event) ?*Event`     | `null`               | Pre-send hook (return same ptr or null to drop) |
-| `before_breadcrumb`       | `?*const fn (Breadcrumb) ?Breadcrumb` | `null`           | Pre-breadcrumb hook (return null to drop)|
-| `cache_dir`               | `[]const u8`                      | `"/tmp/sentry-zig"`  | Directory for crash marker files         |
-| `user_agent`              | `[]const u8`                      | `"sentry-zig/0.1.0"` | User-Agent header for outbound requests  |
-| `install_signal_handlers` | `bool`                            | `true`               | Install POSIX crash signal handlers      |
-| `auto_session_tracking`   | `bool`                            | `false`              | Start a release-health session on init   |
-| `session_mode`            | `SessionMode`                     | `.application`       | Session mode: application or request     |
-| `shutdown_timeout_ms`     | `u64`                             | `2000`               | Flush timeout used during `deinit`       |
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `dsn` | `[]const u8` | required | Sentry DSN |
+| `debug` | `bool` | `false` | Debug flag |
+| `release` | `?[]const u8` | `null` | Release identifier |
+| `environment` | `?[]const u8` | `null` | Environment name |
+| `server_name` | `?[]const u8` | `null` | Host/server name |
+| `sample_rate` | `f64` | `1.0` | Event sampling (`0.0..1.0`) |
+| `traces_sample_rate` | `f64` | `0.0` | Trace sampling (`0.0..1.0`) |
+| `traces_sampler` | `?TracesSampler` | `null` | Per-transaction sampling callback |
+| `max_breadcrumbs` | `u32` | `100` | Scope breadcrumb cap |
+| `before_send` | `?*const fn (*Event) ?*Event` | `null` | Drop/mutate event before queueing |
+| `before_breadcrumb` | `?*const fn (Breadcrumb) ?Breadcrumb` | `null` | Drop/mutate breadcrumb |
+| `cache_dir` | `[]const u8` | `"/tmp/sentry-zig"` | Crash marker directory |
+| `user_agent` | `[]const u8` | `"sentry-zig/0.1.0"` | Transport User-Agent |
+| `install_signal_handlers` | `bool` | `true` | POSIX signal handler install |
+| `auto_session_tracking` | `bool` | `false` | Auto-start session on init |
+| `session_mode` | `SessionMode` | `.application` | `.application` / `.request` |
+| `shutdown_timeout_ms` | `u64` | `2000` | Timeout for shutdown flush |
+
+See [docs/USER_GUIDE.md](docs/USER_GUIDE.md) for full examples and edge cases.
+
+## Shutdown and Reliability
+
+- `flush(timeout_ms)` waits for queue drain without stopping client.
+- `close(null)` flushes (with default timeout) and shuts down worker.
+- `deinit()` is the standard safe shutdown path and should always run.
 
 ## Testing
 
-Run all tests (unit + integration):
+Run all tests:
 
 ```sh
 zig build test
 ```
 
-Run only integration tests:
+Run integration tests only:
 
 ```sh
 zig build test-integration
 ```
+
+## Roadmap Notes
+
+Current focus is complete stability of core data flows:
+events, tracing, sessions, envelopes, and transport behavior.
 
 ## License
 

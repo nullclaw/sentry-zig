@@ -1,34 +1,27 @@
 # Sentry-Zig: User Guide
 
-Практическая документация по подключению SDK в приложение и использованию основных возможностей.
+Практическая документация по подключению SDK и использованию основных возможностей
+в production-приложении.
 
-## 1. Подключение SDK
+## Содержание
 
-Добавьте зависимость:
+1. [Быстрый старт](#быстрый-старт)
+2. [Подключение в build.zig](#подключение-в-buildzig)
+3. [Жизненный цикл клиента](#жизненный-цикл-клиента)
+4. [Захват событий и event_id](#захват-событий-и-event_id)
+5. [Работа со Scope](#работа-со-scope)
+6. [Attachments](#attachments)
+7. [Трейсинг и транзакции](#трейсинг-и-транзакции)
+8. [Release Health Sessions](#release-health-sessions)
+9. [Monitor Check-Ins](#monitor-check-ins)
+10. [Hooks и процессоры](#hooks-и-процессоры)
+11. [Rate limits и очередь](#rate-limits-и-очередь)
+12. [Crash handling (POSIX)](#crash-handling-posix)
+13. [Production checklist](#production-checklist)
+14. [Troubleshooting](#troubleshooting)
+15. [Статус SDK](#статус-sdk)
 
-```sh
-zig fetch --save git+https://github.com/nullclaw/sentry-zig.git
-```
-
-Подключите модуль в `build.zig`:
-
-```zig
-const sentry_dep = b.dependency("sentry-zig", .{
-    .target = target,
-    .optimize = optimize,
-});
-exe.root_module.addImport("sentry-zig", sentry_dep.module("sentry-zig"));
-```
-
-Импортируйте в коде:
-
-```zig
-const sentry = @import("sentry-zig");
-```
-
-## 2. Инициализация клиента
-
-Минимальный рабочий вариант:
+## Быстрый старт
 
 ```zig
 const std = @import("std");
@@ -41,50 +34,79 @@ pub fn main() !void {
         .dsn = "https://PUBLIC_KEY@o0.ingest.sentry.io/PROJECT_ID",
         .release = "my-app@1.0.0",
         .environment = "production",
+        .traces_sample_rate = 1.0,
     });
     defer client.deinit();
 
-    client.captureMessage("app started", .info);
+    client.captureMessage("service started", .info);
     _ = client.flush(5000);
 }
 ```
 
-Рекомендации:
-- `release` лучше всегда задавать (нужен для release health sessions).
-- `environment` задавайте явно (`production`, `staging`, `dev`).
-- На завершении процесса делайте `flush(...)` или `close(...)`.
+## Подключение в build.zig
 
-## 3. Отправка событий
-
-Сообщение:
-
-```zig
-client.captureMessage("payment failed", .err);
+```sh
+zig fetch --save git+https://github.com/nullclaw/sentry-zig.git
 ```
 
-Исключение:
+```zig
+const sentry_dep = b.dependency("sentry-zig", .{
+    .target = target,
+    .optimize = optimize,
+});
+exe.root_module.addImport("sentry-zig", sentry_dep.module("sentry-zig"));
+```
+
+## Жизненный цикл клиента
+
+`Client` управляет:
+- HTTP transport,
+- background worker,
+- rate-limit state,
+- текущим `Scope`,
+- сессией release health.
+
+Базовые правила:
+- Инициализируйте `Client` один раз на процесс.
+- Всегда вызывайте `defer client.deinit();`.
+- Перед завершением процесса при необходимости вызовите `flush(...)`.
+
+Ключевые методы:
+- `flush(timeout_ms)` — ждёт пока очередь опустеет.
+- `close(timeout_ms_or_null)` — завершает сессию, дренирует очередь и выключает worker.
+- `deinit()` — стандартный безопасный shutdown-путь.
+
+## Захват событий и event_id
+
+### Сообщение/исключение
 
 ```zig
+client.captureMessage("checkout failed", .err);
 client.captureException("PaymentError", "gateway timeout");
 ```
 
-Получение `event_id`:
+### Получить `event_id`
 
 ```zig
-if (client.captureMessageId("checkout timeout", .warning)) |event_id| {
-    std.log.info("captured event_id={s}", .{event_id});
+if (client.captureMessageId("retrying payment", .warning)) |event_id| {
+    std.log.warn("event_id={s}", .{event_id});
 }
 ```
 
-Последний принятый ID:
+### Последний принятый ID
 
 ```zig
-if (client.lastEventId()) |id| {
-    std.log.info("last event_id={s}", .{id});
+if (client.lastEventId()) |last_id| {
+    std.log.info("last event={s}", .{last_id});
 }
 ```
 
-## 4. Scope: user, tags, extras, breadcrumbs
+Если событие отфильтровано (`before_send`, processor, sampling), методы `*Id`
+возвращают `null`.
+
+## Работа со Scope
+
+`Scope` автоматически применяется к новым событиям.
 
 ```zig
 client.setUser(.{
@@ -102,7 +124,7 @@ client.addBreadcrumb(.{
 });
 ```
 
-Очистка/удаление:
+Очистка:
 
 ```zig
 client.removeUser();
@@ -112,12 +134,12 @@ client.removeContext("region");
 ```
 
 Дополнительно:
-- `setLevel` задаёт уровень по умолчанию для событий в scope.
-- `setTransaction` и `setFingerprint` позволяют переопределять группировку событий.
+- `setLevel` задаёт level по умолчанию.
+- `setTransaction` и `setFingerprint` влияют на группировку событий.
 
-## 5. Attachments
+## Attachments
 
-Из памяти:
+### Из памяти
 
 ```zig
 var attachment = try sentry.Attachment.initOwned(
@@ -132,7 +154,7 @@ defer attachment.deinit(allocator);
 client.addAttachment(attachment);
 ```
 
-Из файла:
+### Из файла
 
 ```zig
 var file_attachment = try sentry.Attachment.fromPath(
@@ -147,9 +169,10 @@ defer file_attachment.deinit(allocator);
 client.addAttachment(file_attachment);
 ```
 
-После `addAttachment` можно безопасно `deinit` локальную копию: SDK хранит собственную.
+После `addAttachment` локальный объект можно безопасно `deinit`: SDK хранит
+внутреннюю копию.
 
-## 6. Трейсинг и транзакции
+## Трейсинг и транзакции
 
 ```zig
 var txn = client.startTransaction(.{
@@ -160,16 +183,16 @@ defer txn.deinit();
 
 const span = try txn.startChild(.{
     .op = "db.query",
-    .description = "INSERT INTO orders ...",
+    .description = "INSERT INTO orders",
 });
 span.finish();
 
 client.finishTransaction(&txn);
 ```
 
-### Sampling для транзакций
+### Sampling
 
-Фиксированный sample rate:
+Глобально:
 
 ```zig
 const client = try sentry.init(allocator, .{
@@ -178,7 +201,7 @@ const client = try sentry.init(allocator, .{
 });
 ```
 
-Динамический sampler:
+Динамически:
 
 ```zig
 fn traceSampler(ctx: sentry.TracesSamplingContext) f64 {
@@ -195,17 +218,17 @@ const client = try sentry.init(allocator, .{
 
 `traces_sampler` имеет приоритет над `traces_sample_rate`.
 
-## 7. Sessions (Release Health)
+## Release Health Sessions
 
-Ручное управление:
+### Ручной режим
 
 ```zig
 client.startSession();
-// ... работа приложения ...
+// business logic...
 client.endSession(.exited);
 ```
 
-Автоматическое:
+### Авто-режим
 
 ```zig
 const client = try sentry.init(allocator, .{
@@ -216,11 +239,11 @@ const client = try sentry.init(allocator, .{
 ```
 
 Важно:
-- Без `release` сессия не стартует.
-- `session_mode = .application` считает `duration`.
-- `session_mode = .request` duration не отправляет (режим коротких request-сессий).
+- Без `release` сессии не стартуют.
+- `.application` mode считает duration.
+- `.request` mode duration не отправляет.
 
-## 8. Cron Monitoring (Check-ins)
+## Monitor Check-Ins
 
 ```zig
 var check_in = sentry.MonitorCheckIn.init("nightly-job", .in_progress);
@@ -231,20 +254,20 @@ check_in.duration = 12.3;
 client.captureCheckIn(&check_in);
 ```
 
-Если у check-in `environment == null`, SDK подставит `Options.environment`.
+Если `check_in.environment == null`, SDK подставляет `Options.environment`.
 
-## 9. Hooks и event processors
+## Hooks и процессоры
 
-`before_send`:
+### `before_send`
 
 ```zig
 fn beforeSend(event: *sentry.Event) ?*sentry.Event {
-    if (event.level == .debug) return null; // drop
-    return event; // важно: вернуть тот же указатель
+    if (event.level == .debug) return null;
+    return event; // вернуть тот же указатель
 }
 ```
 
-`before_breadcrumb`:
+### `before_breadcrumb`
 
 ```zig
 fn beforeBreadcrumb(crumb: sentry.Breadcrumb) ?sentry.Breadcrumb {
@@ -253,7 +276,7 @@ fn beforeBreadcrumb(crumb: sentry.Breadcrumb) ?sentry.Breadcrumb {
 }
 ```
 
-`event processor` в scope (возвращает `false`, чтобы дропнуть событие):
+### Scope event processor
 
 ```zig
 fn processor(event: *sentry.Event) bool {
@@ -265,59 +288,73 @@ fn processor(event: *sentry.Event) bool {
     return true;
 }
 
-try client.addEventProcessor(processor);
+client.addEventProcessor(processor);
 ```
 
-## 10. Crash handling (POSIX signals)
+## Rate limits и очередь
 
-По умолчанию SDK ставит signal handlers (`SIGSEGV`, `SIGABRT`, `SIGBUS`, `SIGILL`, `SIGFPE`).
+Worker учитывает:
+- `Retry-After`,
+- `X-Sentry-Rate-Limits`.
+
+Поведением по умолчанию:
+- при переполнении очереди удаляются самые старые элементы;
+- envelope с `event` (даже если с attachments) соблюдают `error` category rate-limit;
+- категории `session` и `transaction` лимитируются независимо.
+
+## Crash handling (POSIX)
+
+По умолчанию устанавливаются handlers для:
+- `SIGSEGV`
+- `SIGABRT`
+- `SIGBUS`
+- `SIGILL`
+- `SIGFPE`
 
 Конфигурация:
 - `install_signal_handlers = true|false`
-- `cache_dir` — путь для crash marker файлов.
+- `cache_dir` для crash marker файлов.
 
-## 11. Flush, Close, Deinit
+## Production checklist
 
-`flush(timeout_ms)`:
-- ждёт, пока очередь отправки опустеет;
-- не выключает клиент.
-
-`close(timeout_ms_or_null)`:
-- завершает сессию;
-- flush + shutdown worker;
-- возвращает `true`, если успело дренироваться в timeout.
-
-`deinit()`:
-- безопасное завершение клиента;
-- вызывает shutdown-путь автоматически.
-
-Для обычного приложения достаточно:
-
-```zig
-defer client.deinit();
-// перед выходом по желанию:
-_ = client.flush(5000);
-```
-
-## 12. Проверка и отладка
-
-Запуск всех тестов:
-
-```sh
-zig build test
-```
-
-Только интеграционные:
-
-```sh
-zig build test-integration
-```
-
-## 13. Production checklist
-
-- Задать `release`, `environment`, `server_name`.
-- Выбрать sampling: `sample_rate`, `traces_sample_rate`/`traces_sampler`.
-- Настроить `before_send` для редактирования/фильтрации данных.
-- Добавить breadcrumbs в критические CJM-точки.
+- Явно задать `release`, `environment`, `server_name`.
+- Настроить sampling: `sample_rate`, `traces_sample_rate`/`traces_sampler`.
+- Добавить `before_send` для редактирования/фильтрации payload.
+- Добавить breadcrumbs в критичные CJM-этапы.
 - Проверить graceful shutdown (`flush`/`deinit`).
-- Проверить доставку на staging до выката в production.
+- Проверить отправку событий на staging.
+
+## Troubleshooting
+
+### Нет событий в Sentry
+
+- Проверьте корректность DSN.
+- Проверьте, что процесс не завершается до `flush/deinit`.
+- Проверьте, что событие не дропается в `before_send` или event processor.
+- Проверьте `sample_rate`/`traces_sample_rate`.
+
+### Сессии не отправляются
+
+- Убедитесь, что указан `release`.
+- Убедитесь, что `startSession` действительно вызывается (или `auto_session_tracking=true`).
+
+### Check-ins без environment
+
+- Укажите `Options.environment`, либо заполните `check_in.environment` вручную.
+
+## Статус SDK
+
+Текущий фокус:
+- events/scope/envelope pipeline,
+- transactions/spans/sampling,
+- release health sessions,
+- monitor check-ins,
+- worker + transport rate limits.
+
+Не реализовано на текущий момент:
+- Hub model и TLS scope stack,
+- расширенная экосистема интеграций,
+- structured logs pipeline.
+
+Для трекинга изменений используйте историю коммитов и интеграционные тесты
+в `tests/integration_test.zig`.

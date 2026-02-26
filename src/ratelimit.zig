@@ -231,7 +231,7 @@ test "State applies global and category limits" {
     try testing.expect(state.isEnabled(.transaction, 106 * std.time.ns_per_s));
 }
 
-test "rate limit state mirrors sentry-rust header semantics" {
+test "rate limit state applies header semantics correctly" {
     var state: State = .{};
     const now = 500 * std.time.ns_per_s;
 

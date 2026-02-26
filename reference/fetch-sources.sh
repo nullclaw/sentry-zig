@@ -10,13 +10,6 @@ fi
 
 repos=(
   "https://github.com/getsentry/sentry-native.git"
-  "https://github.com/getsentry/sentry-rust.git"
-  "https://github.com/getsentry/sentry-python.git"
-  "https://github.com/getsentry/sentry-javascript.git"
-  "https://github.com/getsentry/sentry-java.git"
-  "https://github.com/getsentry/sentry-cocoa.git"
-  "https://github.com/getsentry/sentry-dotnet.git"
-  "https://github.com/getsentry/sentry-go.git"
 )
 
 for repo in "${repos[@]}"; do
@@ -39,4 +32,4 @@ for repo in "${repos[@]}"; do
   fi
 done
 
-echo "Reference SDK sources are ready under ${ROOT_DIR}"
+echo "Reference sources are ready under ${ROOT_DIR}"

@@ -173,6 +173,8 @@ pub const Client = struct {
 
     /// Capture a monitor check-in envelope.
     pub fn captureCheckIn(self: *Client, check_in: *const MonitorCheckIn) void {
+        if (!self.isEnabled()) return;
+
         var prepared = check_in.*;
         if (prepared.environment == null) {
             prepared.environment = self.options.environment;
@@ -195,6 +197,8 @@ pub const Client = struct {
 
     /// Capture an event and return its id if accepted by filters/sampling.
     pub fn captureEventId(self: *Client, event: *Event) ?[32]u8 {
+        if (!self.isEnabled()) return null;
+
         var prepared_event_value = event.*;
 
         // Apply defaults from options
@@ -398,6 +402,8 @@ pub const Client = struct {
 
     /// Finish a transaction, serialize it, and submit the envelope to the worker.
     pub fn finishTransaction(self: *Client, txn: *Transaction) void {
+        if (!self.isEnabled()) return;
+
         txn.finish();
 
         if (!txn.sampled) return;
@@ -418,10 +424,12 @@ pub const Client = struct {
 
     /// Start a new session.
     pub fn startSession(self: *Client) void {
+        if (!self.isEnabled()) return;
+
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        // Match sentry-rust behavior: sessions require a configured release.
+        // Sessions require a configured release.
         const release = self.options.release orelse return;
 
         // End any existing session first
@@ -453,8 +461,8 @@ pub const Client = struct {
     // ─── Flush ───────────────────────────────────────────────────────────
 
     /// Returns true when the client has an active background worker.
-    pub fn isEnabled(self: *const Client) bool {
-        return self.worker.thread != null;
+    pub fn isEnabled(self: *Client) bool {
+        return self.worker.isAccepting();
     }
 
     /// Flush and shut down the transport worker.
@@ -808,6 +816,36 @@ test "Client close shuts down worker and disables client" {
     try testing.expect(client.isEnabled());
     _ = client.close(null);
     try testing.expect(!client.isEnabled());
+}
+
+test "Client does not accept events after close" {
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    const before_close = client.captureMessageId("before-close", .info);
+    try testing.expect(before_close != null);
+
+    _ = client.close(null);
+    try testing.expect(!client.isEnabled());
+
+    const after_close = client.captureMessageId("after-close", .info);
+    try testing.expect(after_close == null);
+}
+
+test "Client does not start session after close" {
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .release = "my-app@1.0.0",
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    _ = client.close(null);
+    client.startSession();
+    try testing.expect(client.session == null);
 }
 
 test "Client request session mode disables duration tracking" {

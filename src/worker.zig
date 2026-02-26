@@ -119,6 +119,13 @@ pub const Worker = struct {
         return self.queue.items.len;
     }
 
+    /// Return whether the worker still accepts new items.
+    pub fn isAccepting(self: *Worker) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return !self.shutdown_flag;
+    }
+
     fn workerLoop(self: *Worker) void {
         while (true) {
             var item: ?WorkItem = null;
