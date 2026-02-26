@@ -513,13 +513,16 @@ pub const Client = struct {
     }
 
     /// Set or clear the active span context used for trace propagation.
-    /// Passing null resets propagation context to a new random trace/span pair.
+    /// Passing null clears active span context and falls back to scope propagation context.
     pub fn setSpan(self: *Client, source: ?TransactionOrSpan) void {
         if (source) |value| {
             const trace_context = value.getTraceContext();
-            self.scope.setPropagationContext(trace_context.trace_id, trace_context.span_id);
+            self.scope.setActiveSpanContext(.{
+                .trace_id = trace_context.trace_id,
+                .span_id = trace_context.span_id,
+            });
         } else {
-            self.scope.resetPropagationContext();
+            self.scope.setActiveSpanContext(null);
         }
     }
 
@@ -1777,6 +1780,8 @@ var before_send_trace_first: ?scope_mod.PropagationContext = null;
 var expected_trace_from_span: ?scope_mod.PropagationContext = null;
 var before_send_trace_matches_span: bool = false;
 var before_send_log_matches_span_trace: bool = false;
+var expected_trace_after_span_clear: ?scope_mod.PropagationContext = null;
+var before_send_trace_after_clear_matches_base: bool = false;
 
 fn inspectTraceContextBeforeSend(event: *Event) ?*Event {
     before_send_saw_trace_context = hasTraceContext(event);
@@ -1804,6 +1809,19 @@ fn inspectTraceContextMatchesSpanBeforeSend(event: *Event) ?*Event {
     const expected = expected_trace_from_span orelse return event;
     const observed = getTraceContextFromEvent(event) orelse return event;
     before_send_trace_matches_span =
+        std.mem.eql(u8, observed.trace_id[0..], expected.trace_id[0..]) and
+        std.mem.eql(u8, observed.span_id[0..], expected.span_id[0..]);
+    return event;
+}
+
+fn inspectTraceContextAfterSpanClearBeforeSend(event: *Event) ?*Event {
+    const expected = expected_trace_after_span_clear orelse return event;
+    const observed = getTraceContextFromEvent(event) orelse return event;
+    const message = event.message orelse return event;
+    const formatted = message.formatted orelse return event;
+    if (!std.mem.eql(u8, formatted, "event-after-span-clear")) return event;
+
+    before_send_trace_after_clear_matches_base =
         std.mem.eql(u8, observed.trace_id[0..], expected.trace_id[0..]) and
         std.mem.eql(u8, observed.span_id[0..], expected.span_id[0..]);
     return event;
@@ -2090,6 +2108,36 @@ test "Client setSpan propagates trace context to captured events and logs" {
 
     try testing.expect(before_send_trace_matches_span);
     try testing.expect(before_send_log_matches_span_trace);
+}
+
+test "Client setSpan null falls back to base scope propagation context" {
+    expected_trace_from_span = null;
+    expected_trace_after_span_clear = null;
+    before_send_trace_matches_span = false;
+    before_send_trace_after_clear_matches_base = false;
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .before_send = inspectTraceContextAfterSpanClearBeforeSend,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    const base_context = client.scope.getPropagationContext();
+    expected_trace_after_span_clear = base_context;
+
+    var txn = client.startTransaction(.{
+        .name = "GET /span-clear",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+
+    client.setSpan(.{ .transaction = &txn });
+    try testing.expect(client.captureMessageId("event-with-active-span", .info) != null);
+
+    client.setSpan(null);
+    try testing.expect(client.captureMessageId("event-after-span-clear", .info) != null);
+    try testing.expect(before_send_trace_after_clear_matches_base);
 }
 
 test "Client default_integrations false injects trace context without runtime or os" {

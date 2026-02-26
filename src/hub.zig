@@ -194,9 +194,12 @@ pub const Hub = struct {
     pub fn setSpan(self: *Hub, source: ?TransactionOrSpan) void {
         if (source) |value| {
             const trace_context = value.getTraceContext();
-            self.topScope().setPropagationContext(trace_context.trace_id, trace_context.span_id);
+            self.topScope().setActiveSpanContext(.{
+                .trace_id = trace_context.trace_id,
+                .span_id = trace_context.span_id,
+            });
         } else {
-            self.topScope().resetPropagationContext();
+            self.topScope().setActiveSpanContext(null);
         }
     }
 

@@ -381,6 +381,7 @@ pub const Scope = struct {
     extra: std.StringHashMap(json.Value),
     contexts: std.StringHashMap(json.Value),
     propagation_context: PropagationContext,
+    active_span_context: ?PropagationContext = null,
     attachments: std.ArrayListUnmanaged(Attachment) = .{},
     event_processors: std.ArrayListUnmanaged(EventProcessor) = .{},
     breadcrumbs: BreadcrumbBuffer,
@@ -393,6 +394,7 @@ pub const Scope = struct {
             .extra = std.StringHashMap(json.Value).init(allocator),
             .contexts = std.StringHashMap(json.Value).init(allocator),
             .propagation_context = generatePropagationContext(),
+            .active_span_context = null,
             .breadcrumbs = try BreadcrumbBuffer.init(allocator, max_breadcrumbs),
         };
     }
@@ -409,6 +411,7 @@ pub const Scope = struct {
             .extra = std.StringHashMap(json.Value).init(allocator),
             .contexts = std.StringHashMap(json.Value).init(allocator),
             .propagation_context = self.propagation_context,
+            .active_span_context = self.active_span_context,
             .breadcrumbs = try BreadcrumbBuffer.init(allocator, self.breadcrumbs.capacity),
         };
         errdefer cloned.deinit();
@@ -550,6 +553,13 @@ pub const Scope = struct {
         };
     }
 
+    /// Set active span context override for trace propagation.
+    pub fn setActiveSpanContext(self: *Scope, context: ?PropagationContext) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.active_span_context = context;
+    }
+
     /// Reset propagation context to a new random trace/span pair.
     pub fn resetPropagationContext(self: *Scope) void {
         self.mutex.lock();
@@ -561,7 +571,7 @@ pub const Scope = struct {
     pub fn getPropagationContext(self: *Scope) PropagationContext {
         self.mutex.lock();
         defer self.mutex.unlock();
-        return self.propagation_context;
+        return self.active_span_context orelse self.propagation_context;
     }
 
     /// Build `sentry-trace` header from scope propagation context.
@@ -845,7 +855,8 @@ pub const Scope = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        log_entry.trace_id = self.propagation_context.trace_id;
+        const propagation_context = self.active_span_context orelse self.propagation_context;
+        log_entry.trace_id = propagation_context.trace_id;
 
         if (log_entry.attributes) |value| {
             if (value == .object) {
@@ -859,7 +870,7 @@ pub const Scope = struct {
             allocator,
             &attributes_object,
             "parent_span_id",
-            self.propagation_context.span_id[0..],
+            propagation_context.span_id[0..],
         );
 
         if (self.user) |user| {
@@ -1100,6 +1111,7 @@ pub const Scope = struct {
         self.event_processors.clearRetainingCapacity();
         self.breadcrumbs.clear();
         self.propagation_context = generatePropagationContext();
+        self.active_span_context = null;
     }
 
     fn clearAttachmentsOwned(self: *Scope) void {
@@ -1248,6 +1260,31 @@ test "Scope propagation context can be set and reset" {
     scope.resetPropagationContext();
     const reset = scope.getPropagationContext();
     try testing.expect(!std.mem.eql(u8, original.trace_id[0..], reset.trace_id[0..]) or !std.mem.eql(u8, original.span_id[0..], reset.span_id[0..]));
+}
+
+test "Scope active span context overrides and can be cleared" {
+    var scope = try Scope.init(testing.allocator, 10);
+    defer scope.deinit();
+
+    const base_trace: [32]u8 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".*;
+    const base_span: [16]u8 = "bbbbbbbbbbbbbbbb".*;
+    scope.setPropagationContext(base_trace, base_span);
+
+    const active_trace: [32]u8 = "0123456789abcdef0123456789abcdef".*;
+    const active_span: [16]u8 = "89abcdef01234567".*;
+    scope.setActiveSpanContext(.{
+        .trace_id = active_trace,
+        .span_id = active_span,
+    });
+
+    const active = scope.getPropagationContext();
+    try testing.expectEqualSlices(u8, active_trace[0..], active.trace_id[0..]);
+    try testing.expectEqualSlices(u8, active_span[0..], active.span_id[0..]);
+
+    scope.setActiveSpanContext(null);
+    const restored = scope.getPropagationContext();
+    try testing.expectEqualSlices(u8, base_trace[0..], restored.trace_id[0..]);
+    try testing.expectEqualSlices(u8, base_span[0..], restored.span_id[0..]);
 }
 
 test "Scope sentryTraceHeaderAlloc uses propagation context values" {
