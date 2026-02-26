@@ -2184,6 +2184,33 @@ test "Client request session mode disables duration tracking" {
     try testing.expect(!client.session.?.track_duration);
 }
 
+test "Client request session mode serializes session updates without duration" {
+    var state = PayloadTransportState.init(testing.allocator);
+    defer state.deinit();
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .release = "my-app@1.0.0",
+        .session_mode = .request,
+        .transport = .{
+            .send_fn = payloadTransportSendFn,
+            .ctx = &state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    client.startSession();
+    client.endSession(.exited);
+    _ = client.flush(1000);
+
+    try testing.expectEqual(@as(usize, 1), state.sent_count);
+    try testing.expect(state.last_payload != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"type\":\"session\"") != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"status\":\"exited\"") != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"duration\"") == null);
+}
+
 test "Client session counts errors even when events are sampled out" {
     const client = try Client.init(testing.allocator, .{
         .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
