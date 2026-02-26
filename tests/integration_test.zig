@@ -1182,6 +1182,42 @@ test "CJM e2e: structured log envelope is sent" {
     try testing.expect(relay.containsInAny("\"level\":\"warn\""));
 }
 
+test "CJM e2e: active span propagation context is shared by events and logs" {
+    var relay = try CaptureRelay.init(testing.allocator, &.{});
+    defer relay.deinit();
+    try relay.start();
+
+    const local_dsn = try makeLocalDsn(testing.allocator, relay.port());
+    defer testing.allocator.free(local_dsn);
+
+    const client = try sentry.init(testing.allocator, .{
+        .dsn = local_dsn,
+        .traces_sample_rate = 1.0,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var txn = client.startTransaction(.{
+        .name = "GET /trace-shared",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+
+    client.setSpan(.{ .transaction = &txn });
+    try testing.expect(client.captureMessageId("event-with-active-span", .info) != null);
+    client.captureLogMessage("log-with-active-span", .info);
+
+    try testing.expect(client.flush(2000));
+    try testing.expect(relay.waitForAtLeast(2, 2000));
+
+    const expected_trace = try std.fmt.allocPrint(testing.allocator, "\"trace_id\":\"{s}\"", .{txn.trace_id[0..]});
+    defer testing.allocator.free(expected_trace);
+
+    try testing.expect(relay.containsInAny("\"type\":\"event\""));
+    try testing.expect(relay.containsInAny("\"type\":\"log\""));
+    try testing.expect(relay.containsInAny(expected_trace));
+}
+
 test "CJM e2e: rate limits drop subsequent error envelopes" {
     const response_headers = [_]std.http.Header{
         .{ .name = "X-Sentry-Rate-Limits", .value = "60:error:organization" },
