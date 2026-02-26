@@ -390,6 +390,17 @@ fn configureScopeSetTag(scope: *Scope) void {
     scope.setTag("scope", "configured") catch {};
 }
 
+fn configureScopeReentrantInner(scope: *Scope) void {
+    scope.setTag("which_scope", "inner") catch {};
+}
+
+fn configureScopeReentrantOuter(scope: *Scope) void {
+    scope.setTag("which_scope", "outer") catch {};
+    if (Hub.current()) |hub| {
+        hub.configureScope(configureScopeReentrantInner);
+    }
+}
+
 var hub_integration_lookup_called: bool = false;
 var hub_integration_lookup_received_null: bool = false;
 var hub_integration_lookup_flag_value: ?bool = null;
@@ -536,6 +547,29 @@ test "Hub configureScope applies staged mutation to current scope" {
     try hub.trySetTag("scope", "outer");
     hub.configureScope(configureScopeSetTag);
     try testing.expectEqualStrings("configured", hub.currentScope().tags.get("scope").?);
+}
+
+test "Hub configureScope supports reentrant calls and keeps outer mutation" {
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var hub = try Hub.init(testing.allocator, client);
+    defer hub.deinit();
+
+    const previous_hub = Hub.setCurrent(&hub);
+    defer {
+        if (previous_hub) |prev| {
+            _ = Hub.setCurrent(prev);
+        } else {
+            _ = Hub.clearCurrent();
+        }
+    }
+
+    hub.configureScope(configureScopeReentrantOuter);
+    try testing.expectEqualStrings("outer", hub.currentScope().tags.get("which_scope").?);
 }
 
 test "Hub withIntegration returns configured integration context" {
