@@ -600,11 +600,15 @@ pub const Scope = struct {
 
     /// Apply scope data to an event before sending.
     pub fn applyToEvent(self: *Scope, allocator: Allocator, event: *Event) !ApplyResult {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
         var result: ApplyResult = .{};
         errdefer cleanupAppliedToEvent(allocator, event, result);
+
+        var processor_snapshot: ?[]EventProcessor = null;
+        defer if (processor_snapshot) |snapshot| allocator.free(snapshot);
+
+        self.mutex.lock();
+        var lock_held = true;
+        errdefer if (lock_held) self.mutex.unlock();
 
         if (self.level) |level| {
             result.previous_level = event.level;
@@ -744,8 +748,19 @@ pub const Scope = struct {
             result.applied_breadcrumbs = crumbs;
         }
 
-        for (self.event_processors.items) |processor| {
-            if (!processor(event)) return error.EventDropped;
+        if (self.event_processors.items.len > 0) {
+            const copied = try allocator.alloc(EventProcessor, self.event_processors.items.len);
+            @memcpy(copied, self.event_processors.items);
+            processor_snapshot = copied;
+        }
+
+        self.mutex.unlock();
+        lock_held = false;
+
+        if (processor_snapshot) |processors| {
+            for (processors) |processor| {
+                if (!processor(event)) return error.EventDropped;
+            }
         }
 
         return result;
@@ -1180,6 +1195,15 @@ fn mutateProcessor(event: *Event) bool {
     return true;
 }
 
+var reentrant_scope_for_processor: ?*Scope = null;
+
+fn reentrantScopeProcessor(_: *Event) bool {
+    if (reentrant_scope_for_processor) |scope| {
+        scope.setLevel(.warning);
+    }
+    return true;
+}
+
 test "Scope event processors can mutate and drop events" {
     var scope = try Scope.init(testing.allocator, 10);
     defer scope.deinit();
@@ -1195,4 +1219,20 @@ test "Scope event processors can mutate and drop events" {
 
     var drop_event = Event.init();
     try testing.expectError(error.EventDropped, scope.applyToEvent(testing.allocator, &drop_event));
+}
+
+test "Scope event processors run without holding the scope lock" {
+    var scope = try Scope.init(testing.allocator, 10);
+    defer scope.deinit();
+
+    reentrant_scope_for_processor = &scope;
+    defer reentrant_scope_for_processor = null;
+
+    try scope.addEventProcessor(reentrantScopeProcessor);
+
+    var event = Event.init();
+    const applied = try scope.applyToEvent(testing.allocator, &event);
+    defer cleanupAppliedToEvent(testing.allocator, &event, applied);
+
+    try testing.expectEqual(Level.warning, scope.level.?);
 }
