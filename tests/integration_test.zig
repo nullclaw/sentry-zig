@@ -790,6 +790,7 @@ test "CJM e2e: session emits errored and exited updates" {
 
     try testing.expect(relay.containsInAny("\"type\":\"session\""));
     try testing.expect(relay.containsInAny("\"status\":\"errored\""));
+    try testing.expect(relay.containsInAny("\"seq\":"));
     try testing.expect(relay.containsInAny("\"errors\":1"));
     try testing.expect(relay.containsInAny("\"status\":\"exited\""));
     try testing.expect(relay.containsInAny("\"type\":\"event\""));
