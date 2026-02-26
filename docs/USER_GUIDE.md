@@ -183,6 +183,10 @@ TLS helper methods:
 After `setCurrentHub`, you can use global helper calls:
 - `sentry.captureMessage(...)`
 - `sentry.captureException(...)`
+- `sentry.captureCheckIn(...)`
+- `sentry.startSession()` / `sentry.endSession(...)`
+- `sentry.lastEventId()`
+- `sentry.flush(...)` / `sentry.close(...)`
 - `sentry.addBreadcrumb(...)` / `sentry.clearBreadcrumbs()`
 - `sentry.pushScope()` / `sentry.popScope()`
 - `sentry.withScope(...)`

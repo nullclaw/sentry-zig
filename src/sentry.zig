@@ -148,6 +148,39 @@ pub fn captureLogMessage(message: []const u8, level: LogLevel) bool {
     return true;
 }
 
+pub fn captureCheckIn(check_in: *const MonitorCheckIn) bool {
+    const hub = Hub.current() orelse return false;
+    hub.captureCheckIn(check_in);
+    return true;
+}
+
+pub fn startSession() bool {
+    const hub = Hub.current() orelse return false;
+    hub.startSession();
+    return true;
+}
+
+pub fn endSession(status: SessionStatus) bool {
+    const hub = Hub.current() orelse return false;
+    hub.endSession(status);
+    return true;
+}
+
+pub fn flush(timeout_ms: u64) bool {
+    const hub = Hub.current() orelse return false;
+    return hub.flush(timeout_ms);
+}
+
+pub fn close(timeout_ms: ?u64) bool {
+    const hub = Hub.current() orelse return false;
+    return hub.close(timeout_ms);
+}
+
+pub fn lastEventId() ?[32]u8 {
+    const hub = Hub.current() orelse return null;
+    return hub.lastEventId();
+}
+
 pub fn addBreadcrumb(crumb: Breadcrumb) void {
     if (Hub.current()) |hub| {
         hub.addBreadcrumb(crumb);
@@ -201,6 +234,8 @@ test "global wrappers are safe no-op without current hub" {
     try std.testing.expect(captureMessage("no-hub", .info) == null);
     try std.testing.expect(captureException("TypeError", "no-hub") == null);
     try std.testing.expect(!captureLogMessage("no-hub", .info));
+    var check_in = MonitorCheckIn.init("no-hub", .in_progress);
+    try std.testing.expect(!captureCheckIn(&check_in));
     try std.testing.expect(startTransaction(.{ .name = "no-hub" }) == null);
     try std.testing.expect(startTransactionFromSentryTrace(
         .{ .name = "no-hub" },
@@ -214,6 +249,11 @@ test "global wrappers are safe no-op without current hub" {
     try std.testing.expect(!pushScope());
     try std.testing.expect(!popScope());
     try std.testing.expect(!configureScope(configureScopeSetInner));
+    try std.testing.expect(!startSession());
+    try std.testing.expect(!endSession(.exited));
+    try std.testing.expect(!flush(1));
+    try std.testing.expect(!close(1));
+    try std.testing.expect(lastEventId() == null);
 
     addBreadcrumb(.{ .message = "no-hub" });
     clearBreadcrumbs();
@@ -223,6 +263,7 @@ test "global wrappers are safe no-op without current hub" {
 test "global wrappers route through current hub" {
     const client = try Client.init(std.testing.allocator, .{
         .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .release = "my-app@1.0.0",
         .install_signal_handlers = false,
     });
     defer client.deinit();
@@ -251,8 +292,14 @@ test "global wrappers route through current hub" {
     const event_id = captureMessage("global-capture", .warning);
     try std.testing.expect(event_id != null);
     try std.testing.expectEqualSlices(u8, &event_id.?, &client.lastEventId().?);
+    try std.testing.expectEqualSlices(u8, &event_id.?, &lastEventId().?);
 
     try std.testing.expect(captureLogMessage("global-log", .warn));
+    var check_in = MonitorCheckIn.init("global-check-in", .in_progress);
+    try std.testing.expect(captureCheckIn(&check_in));
+    try std.testing.expect(startSession());
+    try std.testing.expect(endSession(.exited));
+    try std.testing.expect(flush(1000));
 
     var txn = startTransaction(.{ .name = "GET /global", .op = "http.server" }).?;
     defer txn.deinit();
@@ -278,6 +325,10 @@ test "global wrappers route through current hub" {
     ).?;
     defer baggage_only.deinit();
     try std.testing.expectEqualStrings("fedcba9876543210fedcba9876543210", baggage_only.trace_id[0..]);
+
+    try std.testing.expect(close(1000));
+    try std.testing.expect(captureLogMessage("global-log-after-close", .warn));
+    try std.testing.expect(captureMessage("global-capture-after-close", .warning) == null);
 }
 
 test {

@@ -69,7 +69,7 @@ exe.root_module.addImport("sentry-zig", sentry_dep.module("sentry-zig"));
 - `Client`: owns transport, worker queue, and runtime configuration.
 - `Scope`: mutable event context (user, tags, extras, breadcrumbs, attachments).
 - `Hub`: scope stack + thread-local current hub API for scoped captures.
-- Global helpers via current Hub: `captureMessage`, `captureException`, `addBreadcrumb`, `pushScope`, `configureScope`.
+- Global helpers via current Hub: `captureMessage`, `captureException`, `captureCheckIn`, `startSession`, `endSession`, `flush`, `close`, `addBreadcrumb`, `pushScope`, `configureScope`.
 - `Event`: error/message payload (`captureMessage`, `captureException`, `captureEvent`).
 - `Transaction` + `Span`: tracing payloads (`startTransaction`, `finishTransaction`).
 - `Session`: release health lifecycle (`startSession`, `endSession`).
