@@ -40,6 +40,7 @@ const LogLevel = log_mod.LogLevel;
 const propagation = @import("propagation.zig");
 const DynamicSamplingContext = propagation.DynamicSamplingContext;
 const PropagationHeader = propagation.PropagationHeader;
+const Uuid = @import("uuid.zig").Uuid;
 
 const ExceptionFrameOwnership = struct {
     allocator: Allocator,
@@ -64,7 +65,10 @@ pub const SessionMode = enum {
 pub const TracesSamplingContext = struct {
     transaction_name: []const u8,
     transaction_op: ?[]const u8 = null,
+    trace_id: [32]u8,
+    span_id: txn_mod.SpanId,
     parent_sampled: ?bool = null,
+    custom_sampling_context: ?*const json.Value = null,
 };
 
 pub const IntegrationSetupFn = *const fn (*Client, ?*anyopaque) void;
@@ -657,13 +661,22 @@ pub const Client = struct {
         if (real_opts.release == null) real_opts.release = self.options.release;
         if (real_opts.dist == null) real_opts.dist = self.options.dist;
         if (real_opts.environment == null) real_opts.environment = self.options.environment;
+        if (real_opts.trace_id == null) {
+            real_opts.trace_id = real_opts.parent_trace_id orelse Uuid.v4().toHex();
+        }
+        if (real_opts.span_id == null) {
+            real_opts.span_id = txn_mod.generateSpanId();
+        }
 
         const effective_sample_rate: f64 = blk: {
             if (self.options.traces_sampler) |sampler| {
                 const sampled_rate = sampler(.{
                     .transaction_name = real_opts.name,
                     .transaction_op = real_opts.op,
+                    .trace_id = real_opts.trace_id.?,
+                    .span_id = real_opts.span_id.?,
                     .parent_sampled = real_opts.parent_sampled,
+                    .custom_sampling_context = if (real_opts.custom_sampling_context) |*value| value else null,
                 });
                 break :blk if (isValidSampleRate(sampled_rate)) sampled_rate else 0.0;
             }
@@ -1838,6 +1851,37 @@ fn alwaysSampleTraces(_: TracesSamplingContext) f64 {
 
 fn neverSampleTraces(_: TracesSamplingContext) f64 {
     return 0.0;
+}
+
+var sampler_observed_custom_context: bool = false;
+var sampler_observed_parent_sampled: ?bool = null;
+var sampler_observed_trace_id: ?[32]u8 = null;
+var sampler_observed_span_id: ?txn_mod.SpanId = null;
+
+fn sampleTracesFromCustomContext(ctx: TracesSamplingContext) f64 {
+    sampler_observed_custom_context = false;
+    sampler_observed_parent_sampled = ctx.parent_sampled;
+    sampler_observed_trace_id = ctx.trace_id;
+    sampler_observed_span_id = ctx.span_id;
+    if (ctx.custom_sampling_context) |value| {
+        sampler_observed_custom_context = true;
+        if (value.* == .object) {
+            if (value.object.get("rate")) |rate| {
+                switch (rate) {
+                    .float => return rate.float,
+                    .integer => return @as(f64, @floatFromInt(rate.integer)),
+                    else => {},
+                }
+            }
+        }
+    }
+    return 0.1;
+}
+
+fn sampleTracesAndCaptureIds(ctx: TracesSamplingContext) f64 {
+    sampler_observed_trace_id = ctx.trace_id;
+    sampler_observed_span_id = ctx.span_id;
+    return 1.0;
 }
 
 const CustomTransportState = struct {
@@ -3230,6 +3274,86 @@ test "Client traces_sampler overrides traces_sample_rate" {
 
     try testing.expectEqual(@as(f64, 0.0), never_txn.sample_rate);
     try testing.expect(!never_txn.sampled);
+}
+
+test "Client traces_sampler receives custom sampling context from transaction opts" {
+    sampler_observed_custom_context = false;
+    sampler_observed_parent_sampled = null;
+    sampler_observed_trace_id = null;
+    sampler_observed_span_id = null;
+
+    var custom_sampling_context: json.Value = .{ .object = json.ObjectMap.init(testing.allocator) };
+    defer scope_mod.deinitJsonValueDeep(testing.allocator, &custom_sampling_context);
+    try Client.putOwnedJsonEntry(testing.allocator, &custom_sampling_context.object, "rate", .{ .float = 0.7 });
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 0.0,
+        .traces_sampler = sampleTracesFromCustomContext,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var txn = client.startTransaction(.{
+        .name = "GET /custom-sampling-context",
+        .op = "http.server",
+        .parent_sampled = true,
+        .custom_sampling_context = custom_sampling_context,
+    });
+    defer txn.deinit();
+
+    try testing.expect(sampler_observed_custom_context);
+    try testing.expectEqual(@as(?bool, true), sampler_observed_parent_sampled);
+    try testing.expect(sampler_observed_trace_id != null);
+    try testing.expect(sampler_observed_span_id != null);
+    try testing.expectEqualSlices(u8, sampler_observed_trace_id.?[0..], txn.trace_id[0..]);
+    try testing.expectEqualSlices(u8, sampler_observed_span_id.?[0..], txn.span_id[0..]);
+    try testing.expectApproxEqAbs(@as(f64, 0.7), txn.sample_rate, 0.000_001);
+}
+
+test "Client traces_sampler observes transaction ids used by startTransaction" {
+    sampler_observed_trace_id = null;
+    sampler_observed_span_id = null;
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 0.0,
+        .traces_sampler = sampleTracesAndCaptureIds,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var txn = client.startTransaction(.{
+        .name = "GET /sampler-ids",
+    });
+    defer txn.deinit();
+
+    try testing.expect(sampler_observed_trace_id != null);
+    try testing.expect(sampler_observed_span_id != null);
+    try testing.expectEqualSlices(u8, sampler_observed_trace_id.?[0..], txn.trace_id[0..]);
+    try testing.expectEqualSlices(u8, sampler_observed_span_id.?[0..], txn.span_id[0..]);
+}
+
+test "Client startTransaction accepts explicit trace_id and span_id" {
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    const explicit_trace_id = "0123456789abcdef0123456789abcdef".*;
+    const explicit_span_id = "89abcdef01234567".*;
+
+    var txn = client.startTransaction(.{
+        .name = "GET /explicit-ids",
+        .trace_id = explicit_trace_id,
+        .span_id = explicit_span_id,
+    });
+    defer txn.deinit();
+
+    try testing.expectEqualSlices(u8, explicit_trace_id[0..], txn.trace_id[0..]);
+    try testing.expectEqualSlices(u8, explicit_span_id[0..], txn.span_id[0..]);
 }
 
 test "Client startTransactionWithTimestamp applies explicit start timestamp" {

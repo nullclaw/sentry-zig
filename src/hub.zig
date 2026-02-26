@@ -406,6 +406,13 @@ pub const Hub = struct {
     pub fn current() ?*Hub {
         return current_hub_tls;
     }
+
+    /// Temporarily installs `hub` as current TLS hub for callback duration.
+    pub fn run(hub: *Hub, callback: *const fn () void) void {
+        const previous = Hub.setCurrent(hub);
+        defer current_hub_tls = previous;
+        callback();
+    }
 };
 
 fn dropEvent(_: *Event) bool {
@@ -464,6 +471,8 @@ fn configureScopeReentrantOuter(scope: *Scope) void {
 var hub_integration_lookup_called: bool = false;
 var hub_integration_lookup_received_null: bool = false;
 var hub_integration_lookup_flag_value: ?bool = null;
+var hub_run_expected_ptr: ?*Hub = null;
+var hub_run_observed_expected_current: bool = false;
 
 fn hubIntegrationSetup(_: *Client, ctx: ?*anyopaque) void {
     if (ctx) |ptr| {
@@ -484,6 +493,15 @@ fn inspectHubIntegrationLookup(ctx: ?*anyopaque) void {
 }
 
 fn otherHubIntegrationSetup(_: *Client, _: ?*anyopaque) void {}
+
+fn hubRunObserveCurrent() void {
+    hub_run_observed_expected_current = false;
+    if (Hub.current()) |hub| {
+        if (hub_run_expected_ptr) |expected| {
+            hub_run_observed_expected_current = hub == expected;
+        }
+    }
+}
 
 const HubPayloadTransportState = struct {
     allocator: Allocator,
@@ -998,6 +1016,49 @@ test "Hub TLS current set and clear" {
     try testing.expect(Hub.setCurrent(&hub) == null);
     try testing.expect(Hub.current().? == &hub);
     try testing.expect(Hub.clearCurrent().? == &hub);
+    try testing.expect(Hub.current() == null);
+}
+
+test "Hub run temporarily swaps current TLS hub and restores previous" {
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var primary = try Hub.init(testing.allocator, client);
+    defer primary.deinit();
+
+    var temporary = try Hub.initFromTop(testing.allocator, &primary, null);
+    defer temporary.deinit();
+
+    _ = Hub.setCurrent(&primary);
+    defer _ = Hub.clearCurrent();
+
+    hub_run_expected_ptr = &temporary;
+    hub_run_observed_expected_current = false;
+    Hub.run(&temporary, hubRunObserveCurrent);
+
+    try testing.expect(hub_run_observed_expected_current);
+    try testing.expect(Hub.current().? == &primary);
+}
+
+test "Hub run clears TLS current when previously unset" {
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var temporary = try Hub.init(testing.allocator, client);
+    defer temporary.deinit();
+
+    _ = Hub.clearCurrent();
+    hub_run_expected_ptr = &temporary;
+    hub_run_observed_expected_current = false;
+    Hub.run(&temporary, hubRunObserveCurrent);
+
+    try testing.expect(hub_run_observed_expected_current);
     try testing.expect(Hub.current() == null);
 }
 

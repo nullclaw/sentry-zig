@@ -179,6 +179,7 @@ TLS helper methods:
 - `sentry.setCurrentHub(&hub)`
 - `sentry.currentHub()`
 - `sentry.clearCurrentHub()`
+- `sentry.Hub.run(&hub, callback)` for temporary TLS hub override
 
 After `setCurrentHub`, you can use global helper calls:
 - `sentry.captureMessage(...)`
@@ -236,6 +237,15 @@ var txn = client.startTransaction(.{
     .op = "http.server",
 });
 defer txn.deinit();
+
+// Optional explicit trace/span ids (advanced distributed tracing control)
+var fixed_ids_txn = client.startTransaction(.{
+    .name = "POST /checkout-fixed",
+    .op = "http.server",
+    .trace_id = "0123456789abcdef0123456789abcdef".*,
+    .span_id = "89abcdef01234567".*,
+});
+defer fixed_ids_txn.deinit();
 
 // Optional explicit start timestamp (seconds, unix epoch)
 var timed_txn = client.startTransactionWithTimestamp(.{
@@ -303,6 +313,17 @@ Dynamically:
 
 ```zig
 fn traceSampler(ctx: sentry.TracesSamplingContext) f64 {
+    if (ctx.custom_sampling_context) |custom| {
+        if (custom.* == .object) {
+            if (custom.object.get("rate")) |rate| {
+                switch (rate) {
+                    .float => return rate.float,
+                    .integer => return @as(f64, @floatFromInt(rate.integer)),
+                    else => {},
+                }
+            }
+        }
+    }
     if (std.mem.eql(u8, ctx.transaction_name, "POST /checkout")) return 1.0;
     return 0.1;
 }
@@ -315,6 +336,9 @@ const client = try sentry.init(allocator, .{
 ```
 
 `traces_sampler` has priority over `traces_sample_rate`.
+Sampler context includes `transaction_name`, `transaction_op`, `trace_id`, `span_id`,
+`parent_sampled`, and per-transaction custom input from
+`TransactionOpts.custom_sampling_context`.
 
 For regular event messages, the SDK automatically adds default contexts
 (`contexts.trace`, `contexts.runtime`, `contexts.os`) when trace context

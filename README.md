@@ -170,6 +170,13 @@ var timed_txn = client.startTransactionWithTimestamp(
     1704067200.125,
 );
 defer timed_txn.deinit();
+var fixed_ids_txn = client.startTransaction(.{
+    .name = "GET /orders-fixed",
+    .op = "http.server",
+    .trace_id = "0123456789abcdef0123456789abcdef".*,
+    .span_id = "89abcdef01234567".*,
+});
+defer fixed_ids_txn.deinit();
 // Optional explicit child-span details
 const fixed_span = try timed_txn.startChildWithDetails(
     .{ .op = "db.query", .description = "SELECT 1" },
@@ -261,6 +268,8 @@ All options are provided via `sentry.Options` in `sentry.init`.
 
 When `default_integrations = false`, automatic runtime/os context enrichment is disabled
 (trace context bootstrap remains enabled).
+`traces_sampler` receives `transaction_name`, `transaction_op`, `trace_id`, `span_id`,
+`parent_sampled`, and optional `custom_sampling_context` from `TransactionOpts`.
 When `server_name` is unset and `default_integrations = true`, the SDK attempts to use the local hostname.
 `in_app_include`/`in_app_exclude` are applied to exception stack frames.
 `accept_invalid_certs=true` is intended for local/dev environments and is not supported together with explicit proxy transport.

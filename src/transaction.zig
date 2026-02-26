@@ -246,12 +246,16 @@ pub const TransactionOpts = struct {
     name: []const u8,
     op: ?[]const u8 = null,
     description: ?[]const u8 = null,
+    // Optional arbitrary context passed to traces_sampler only.
+    custom_sampling_context: ?json.Value = null,
     start_timestamp: ?f64 = null,
     sampled: bool = true,
     sample_rate: f64 = 1.0,
     release: ?[]const u8 = null,
     dist: ?[]const u8 = null,
     environment: ?[]const u8 = null,
+    trace_id: ?[32]u8 = null,
+    span_id: ?SpanId = null,
     parent_trace_id: ?[32]u8 = null,
     parent_span_id: ?SpanId = null,
     parent_sampled: ?bool = null,
@@ -403,8 +407,8 @@ pub const Transaction = struct {
         const event_uuid = Uuid.v4();
         return Transaction{
             .event_id = event_uuid.toHex(),
-            .trace_id = opts.parent_trace_id orelse Uuid.v4().toHex(),
-            .span_id = generateSpanId(),
+            .trace_id = opts.trace_id orelse opts.parent_trace_id orelse Uuid.v4().toHex(),
+            .span_id = opts.span_id orelse generateSpanId(),
             .parent_span_id = opts.parent_span_id,
             .name = opts.name,
             .op = opts.op,
