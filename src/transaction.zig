@@ -4,7 +4,7 @@ const testing = std.testing;
 const json = std.json;
 const Writer = std.io.Writer;
 
-const scope_mod = @import("scope.zig");
+const json_value_mod = @import("json_value.zig");
 const User = @import("event.zig").User;
 const Uuid = @import("uuid.zig").Uuid;
 const ts = @import("timestamp.zig");
@@ -433,7 +433,7 @@ pub const Transaction = struct {
             self.allocator.free(value);
         }
         if (self.request) |*value| {
-            scope_mod.deinitJsonValueDeep(self.allocator, value);
+            json_value_mod.deinitJsonValueDeep(self.allocator, value);
             self.request = null;
         }
         if (self.user) |*value| {
@@ -579,7 +579,7 @@ pub const Transaction = struct {
         var obj = json.ObjectMap.init(self.allocator);
         errdefer {
             var value: json.Value = .{ .object = obj };
-            scope_mod.deinitJsonValueDeep(self.allocator, &value);
+            json_value_mod.deinitJsonValueDeep(self.allocator, &value);
         }
 
         if (request.method) |value| try putOwnedJsonEntry(self.allocator, &obj, "method", .{ .string = try self.allocator.dupe(u8, value) });
@@ -587,11 +587,11 @@ pub const Transaction = struct {
         if (request.data) |value| try putOwnedJsonEntry(self.allocator, &obj, "data", .{ .string = try self.allocator.dupe(u8, value) });
         if (request.query_string) |value| try putOwnedJsonEntry(self.allocator, &obj, "query_string", .{ .string = try self.allocator.dupe(u8, value) });
         if (request.cookies) |value| try putOwnedJsonEntry(self.allocator, &obj, "cookies", .{ .string = try self.allocator.dupe(u8, value) });
-        if (request.headers) |value| try putOwnedJsonEntry(self.allocator, &obj, "headers", try scope_mod.cloneJsonValue(self.allocator, value));
-        if (request.env) |value| try putOwnedJsonEntry(self.allocator, &obj, "env", try scope_mod.cloneJsonValue(self.allocator, value));
+        if (request.headers) |value| try putOwnedJsonEntry(self.allocator, &obj, "headers", try json_value_mod.cloneJsonValue(self.allocator, value));
+        if (request.env) |value| try putOwnedJsonEntry(self.allocator, &obj, "env", try json_value_mod.cloneJsonValue(self.allocator, value));
 
         if (self.request) |*existing| {
-            scope_mod.deinitJsonValueDeep(self.allocator, existing);
+            json_value_mod.deinitJsonValueDeep(self.allocator, existing);
         }
         self.request = .{ .object = obj };
     }
@@ -782,7 +782,7 @@ fn deinitJsonMapOwned(allocator: Allocator, map: *std.StringHashMap(json.Value))
     var it = map.iterator();
     while (it.next()) |entry| {
         allocator.free(@constCast(entry.key_ptr.*));
-        scope_mod.deinitJsonValueDeep(allocator, entry.value_ptr);
+        json_value_mod.deinitJsonValueDeep(allocator, entry.value_ptr);
     }
     map.deinit();
 }
@@ -814,13 +814,13 @@ fn setJsonMapEntry(
 ) !void {
     const key_copy = try allocator.dupe(u8, key);
     errdefer allocator.free(key_copy);
-    var value_copy = try scope_mod.cloneJsonValue(allocator, value);
-    errdefer scope_mod.deinitJsonValueDeep(allocator, &value_copy);
+    var value_copy = try json_value_mod.cloneJsonValue(allocator, value);
+    errdefer json_value_mod.deinitJsonValueDeep(allocator, &value_copy);
 
     if (map.fetchRemove(key)) |kv| {
         allocator.free(@constCast(kv.key));
         var old = kv.value;
-        scope_mod.deinitJsonValueDeep(allocator, &old);
+        json_value_mod.deinitJsonValueDeep(allocator, &old);
     }
 
     try map.put(key_copy, value_copy);
@@ -863,7 +863,7 @@ fn putOwnedJsonEntry(
     if (obj.fetchOrderedRemove(key)) |kv| {
         allocator.free(@constCast(kv.key));
         var old = kv.value;
-        scope_mod.deinitJsonValueDeep(allocator, &old);
+        json_value_mod.deinitJsonValueDeep(allocator, &old);
     }
 
     const key_copy = try allocator.dupe(u8, key);
@@ -1217,7 +1217,7 @@ test "Transaction metadata setters serialize trace data tags extra and origin" {
         try obj.put(key, .{ .string = value });
         break :blk obj;
     } };
-    defer scope_mod.deinitJsonValueDeep(testing.allocator, &app_context);
+    defer json_value_mod.deinitJsonValueDeep(testing.allocator, &app_context);
     try txn.setContext("app", app_context);
     try txn.setOrigin("auto.http");
     txn.setName("GET /meta-renamed");

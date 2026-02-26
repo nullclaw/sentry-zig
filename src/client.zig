@@ -515,15 +515,7 @@ pub const Client = struct {
     /// Set or clear the active span context used for trace propagation.
     /// Passing null clears active span context and falls back to scope propagation context.
     pub fn setSpan(self: *Client, source: ?TransactionOrSpan) void {
-        if (source) |value| {
-            const trace_context = value.getTraceContext();
-            self.scope.setActiveSpanContext(.{
-                .trace_id = trace_context.trace_id,
-                .span_id = trace_context.span_id,
-            });
-        } else {
-            self.scope.setActiveSpanContext(null);
-        }
+        self.scope.setSpan(source);
     }
 
     /// Set fingerprint override on scope.

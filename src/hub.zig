@@ -192,15 +192,7 @@ pub const Hub = struct {
 
     /// Set or clear active span context for trace propagation on the top scope.
     pub fn setSpan(self: *Hub, source: ?TransactionOrSpan) void {
-        if (source) |value| {
-            const trace_context = value.getTraceContext();
-            self.topScope().setActiveSpanContext(.{
-                .trace_id = trace_context.trace_id,
-                .span_id = trace_context.span_id,
-            });
-        } else {
-            self.topScope().setActiveSpanContext(null);
-        }
+        self.topScope().setSpan(source);
     }
 
     pub fn setFingerprint(self: *Hub, fingerprint: ?[]const []const u8) void {

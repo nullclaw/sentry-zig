@@ -13,6 +13,8 @@ const Uuid = @import("uuid.zig").Uuid;
 const ts = @import("timestamp.zig");
 const propagation = @import("propagation.zig");
 const envelope = @import("envelope.zig");
+const transaction_mod = @import("transaction.zig");
+const TransactionOrSpan = transaction_mod.TransactionOrSpan;
 
 pub const MAX_BREADCRUMBS = 200;
 pub const EventProcessor = *const fn (*Event) bool;
@@ -381,6 +383,7 @@ pub const Scope = struct {
     extra: std.StringHashMap(json.Value),
     contexts: std.StringHashMap(json.Value),
     propagation_context: PropagationContext,
+    active_span: ?TransactionOrSpan = null,
     active_span_context: ?PropagationContext = null,
     attachments: std.ArrayListUnmanaged(Attachment) = .{},
     event_processors: std.ArrayListUnmanaged(EventProcessor) = .{},
@@ -394,6 +397,7 @@ pub const Scope = struct {
             .extra = std.StringHashMap(json.Value).init(allocator),
             .contexts = std.StringHashMap(json.Value).init(allocator),
             .propagation_context = generatePropagationContext(),
+            .active_span = null,
             .active_span_context = null,
             .breadcrumbs = try BreadcrumbBuffer.init(allocator, max_breadcrumbs),
         };
@@ -411,6 +415,7 @@ pub const Scope = struct {
             .extra = std.StringHashMap(json.Value).init(allocator),
             .contexts = std.StringHashMap(json.Value).init(allocator),
             .propagation_context = self.propagation_context,
+            .active_span = self.active_span,
             .active_span_context = self.active_span_context,
             .breadcrumbs = try BreadcrumbBuffer.init(allocator, self.breadcrumbs.capacity),
         };
@@ -557,7 +562,32 @@ pub const Scope = struct {
     pub fn setActiveSpanContext(self: *Scope, context: ?PropagationContext) void {
         self.mutex.lock();
         defer self.mutex.unlock();
+        self.active_span = null;
         self.active_span_context = context;
+    }
+
+    /// Set active span source for trace propagation and scope-level transaction overrides.
+    pub fn setSpan(self: *Scope, source: ?TransactionOrSpan) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        self.active_span = source;
+        if (source) |value| {
+            const trace_context = value.getTraceContext();
+            self.active_span_context = .{
+                .trace_id = trace_context.trace_id,
+                .span_id = trace_context.span_id,
+            };
+        } else {
+            self.active_span_context = null;
+        }
+    }
+
+    /// Get currently active span source, if any.
+    pub fn getSpan(self: *Scope) ?TransactionOrSpan {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.active_span;
     }
 
     /// Reset propagation context to a new random trace/span pair.
@@ -571,6 +601,13 @@ pub const Scope = struct {
     pub fn getPropagationContext(self: *Scope) PropagationContext {
         self.mutex.lock();
         defer self.mutex.unlock();
+        if (self.active_span) |source| {
+            const trace_context = source.getTraceContext();
+            return .{
+                .trace_id = trace_context.trace_id,
+                .span_id = trace_context.span_id,
+            };
+        }
         return self.active_span_context orelse self.propagation_context;
     }
 
@@ -603,6 +640,21 @@ pub const Scope = struct {
 
         self.transaction = replacement;
         replacement = null;
+
+        if (transaction) |name| {
+            if (self.active_span) |source| {
+                switch (source) {
+                    .transaction => |active_txn| active_txn.setName(name),
+                    .span => |active_span| {
+                        if (active_span.owner) |owner| {
+                            owner.setName(name);
+                        } else {
+                            active_span.setName(name);
+                        }
+                    },
+                }
+            }
+        }
     }
 
     /// Set scope fingerprint override.
@@ -1111,6 +1163,7 @@ pub const Scope = struct {
         self.event_processors.clearRetainingCapacity();
         self.breadcrumbs.clear();
         self.propagation_context = generatePropagationContext();
+        self.active_span = null;
         self.active_span_context = null;
     }
 
@@ -1285,6 +1338,26 @@ test "Scope active span context overrides and can be cleared" {
     const restored = scope.getPropagationContext();
     try testing.expectEqualSlices(u8, base_trace[0..], restored.trace_id[0..]);
     try testing.expectEqualSlices(u8, base_span[0..], restored.span_id[0..]);
+}
+
+test "Scope setSpan stores and clears active span source" {
+    var scope = try Scope.init(testing.allocator, 10);
+    defer scope.deinit();
+
+    var txn = transaction_mod.Transaction.init(testing.allocator, .{
+        .name = "scope-span-source",
+    });
+    defer txn.deinit();
+
+    scope.setSpan(.{ .transaction = &txn });
+    const active = scope.getSpan();
+    try testing.expect(active != null);
+    const trace = active.?.getTraceContext();
+    try testing.expectEqualSlices(u8, txn.trace_id[0..], trace.trace_id[0..]);
+    try testing.expectEqualSlices(u8, txn.span_id[0..], trace.span_id[0..]);
+
+    scope.setSpan(null);
+    try testing.expect(scope.getSpan() == null);
 }
 
 test "Scope sentryTraceHeaderAlloc uses propagation context values" {
@@ -1672,6 +1745,26 @@ test "Scope applyToTransaction applies transaction name override" {
 
     try testing.expect(probe.name != null);
     try testing.expectEqualStrings("renamed-transaction", probe.name.?);
+}
+
+test "Scope setTransaction updates active span transaction name" {
+    var scope = try Scope.init(testing.allocator, 10);
+    defer scope.deinit();
+
+    var txn = transaction_mod.Transaction.init(testing.allocator, .{
+        .name = "old-transaction",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+
+    scope.setSpan(.{ .transaction = &txn });
+    try scope.setTransaction("new-transaction");
+    try testing.expectEqualStrings("new-transaction", txn.name);
+
+    const child = try txn.startChild(.{ .op = "db.query" });
+    scope.setSpan(.{ .span = child });
+    try scope.setTransaction("new-transaction-from-span");
+    try testing.expectEqualStrings("new-transaction-from-span", txn.name);
 }
 
 test "Scope applyToTransaction propagates transaction sink errors" {
