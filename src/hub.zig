@@ -7,6 +7,7 @@ const client_mod = @import("client.zig");
 const Client = client_mod.Client;
 const Transaction = @import("transaction.zig").Transaction;
 const TransactionOpts = @import("transaction.zig").TransactionOpts;
+const PropagationHeader = @import("propagation.zig").PropagationHeader;
 const Event = @import("event.zig").Event;
 const Level = @import("event.zig").Level;
 const User = @import("event.zig").User;
@@ -293,6 +294,10 @@ pub const Hub = struct {
         );
     }
 
+    pub fn startTransactionFromHeaders(self: *Hub, opts: TransactionOpts, headers: []const PropagationHeader) Transaction {
+        return self.client.startTransactionFromHeaders(opts, headers);
+    }
+
     pub fn finishTransaction(self: *Hub, txn: *Transaction) void {
         self.client.finishTransaction(txn);
     }
@@ -481,6 +486,28 @@ test "Hub startTransactionFromPropagationHeaders continues upstream trace" {
         "0123456789abcdef0123456789abcdef-89abcdef01234567-1",
         null,
     );
+    defer txn.deinit();
+
+    try testing.expectEqualStrings("0123456789abcdef0123456789abcdef", txn.trace_id[0..]);
+    try testing.expect(txn.parent_span_id != null);
+    try testing.expectEqualStrings("89abcdef01234567", txn.parent_span_id.?[0..]);
+}
+
+test "Hub startTransactionFromHeaders continues upstream trace" {
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var hub = try Hub.init(testing.allocator, client);
+    defer hub.deinit();
+
+    const headers = [_]PropagationHeader{
+        .{ .name = "sentry-trace", .value = "0123456789abcdef0123456789abcdef-89abcdef01234567-1" },
+    };
+    var txn = hub.startTransactionFromHeaders(.{ .name = "GET /hub-headers" }, &headers);
     defer txn.deinit();
 
     try testing.expectEqualStrings("0123456789abcdef0123456789abcdef", txn.trace_id[0..]);

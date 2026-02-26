@@ -12,6 +12,11 @@ pub const SentryTrace = struct {
     sampled: ?bool = null,
 };
 
+pub const PropagationHeader = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
 pub const DynamicSamplingContext = struct {
     trace_id: [32]u8,
     public_key: []const u8,
@@ -74,6 +79,16 @@ pub fn parseSentryTrace(header_value: []const u8) ?SentryTrace {
 
     if (sampled_part != null and trace.sampled == null) return null;
     return trace;
+}
+
+pub fn parseHeaders(headers: []const PropagationHeader) ?SentryTrace {
+    for (headers) |header| {
+        const name = std.mem.trim(u8, header.name, " \t");
+        if (std.ascii.eqlIgnoreCase(name, "sentry-trace")) {
+            return parseSentryTrace(header.value);
+        }
+    }
+    return null;
 }
 
 pub fn formatSentryTraceAlloc(allocator: Allocator, trace: SentryTrace) ![]u8 {
@@ -335,6 +350,25 @@ test "parseSentryTrace rejects invalid headers" {
     try testing.expect(parseSentryTrace("abc-def") == null);
     try testing.expect(parseSentryTrace("0123456789abcdef0123456789abcdef-0123456789abcdef-x") == null);
     try testing.expect(parseSentryTrace("0123456789abcdef0123456789abcde-0123456789abcdef-1") == null);
+}
+
+test "parseHeaders reads sentry-trace header case-insensitively" {
+    const headers = [_]PropagationHeader{
+        .{ .name = "content-type", .value = "application/json" },
+        .{ .name = "SenTrY-TRAce", .value = "0123456789abcdef0123456789abcdef-0123456789abcdef-0" },
+    };
+
+    const parsed = parseHeaders(&headers).?;
+    try testing.expectEqualStrings("0123456789abcdef0123456789abcdef", &parsed.trace_id);
+    try testing.expectEqualStrings("0123456789abcdef", &parsed.span_id);
+    try testing.expectEqual(@as(?bool, false), parsed.sampled);
+}
+
+test "parseHeaders returns null for invalid sentry-trace value" {
+    const headers = [_]PropagationHeader{
+        .{ .name = "sentry-trace", .value = "invalid" },
+    };
+    try testing.expect(parseHeaders(&headers) == null);
 }
 
 test "formatSentryTraceAlloc emits expected format" {

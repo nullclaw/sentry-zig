@@ -38,6 +38,7 @@ const LogEntry = log_mod.LogEntry;
 const LogLevel = log_mod.LogLevel;
 const propagation = @import("propagation.zig");
 const DynamicSamplingContext = propagation.DynamicSamplingContext;
+const PropagationHeader = propagation.PropagationHeader;
 
 const ExceptionFrameOwnership = struct {
     allocator: Allocator,
@@ -689,6 +690,34 @@ pub const Client = struct {
             txn.incoming_baggage = try self.allocator.dupe(u8, baggage);
         }
         return txn;
+    }
+
+    /// Start a transaction by scanning raw headers for `sentry-trace`
+    /// and `baggage`.
+    pub fn startTransactionFromHeaders(
+        self: *Client,
+        opts: TransactionOpts,
+        headers: []const PropagationHeader,
+    ) Transaction {
+        var sentry_trace_header: ?[]const u8 = null;
+        var baggage_header: ?[]const u8 = null;
+
+        for (headers) |header| {
+            const name = std.mem.trim(u8, header.name, " \t");
+            if (sentry_trace_header == null and std.ascii.eqlIgnoreCase(name, "sentry-trace")) {
+                sentry_trace_header = header.value;
+                continue;
+            }
+            if (baggage_header == null and std.ascii.eqlIgnoreCase(name, "baggage")) {
+                baggage_header = header.value;
+            }
+        }
+
+        return self.startTransactionFromPropagationHeaders(
+            opts,
+            sentry_trace_header,
+            baggage_header,
+        ) catch self.startTransaction(opts);
     }
 
     /// Build `sentry-trace` header value for an outgoing downstream request.
@@ -2305,6 +2334,51 @@ test "Client startTransactionFromPropagationHeaders applies baggage sample_rate"
     try testing.expectEqualStrings("fedcba9876543210fedcba9876543210", txn.trace_id[0..]);
     try testing.expectEqual(@as(f64, 0.0), txn.sample_rate);
     try testing.expect(!txn.sampled);
+}
+
+test "Client startTransactionFromHeaders continues upstream trace context" {
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    const headers = [_]PropagationHeader{
+        .{ .name = "content-type", .value = "application/json" },
+        .{ .name = "sentry-trace", .value = "0123456789abcdef0123456789abcdef-89abcdef01234567-1" },
+    };
+    var txn = client.startTransactionFromHeaders(.{
+        .name = "GET /headers",
+        .op = "http.server",
+    }, &headers);
+    defer txn.deinit();
+
+    try testing.expectEqualStrings("0123456789abcdef0123456789abcdef", txn.trace_id[0..]);
+    try testing.expect(txn.parent_span_id != null);
+    try testing.expectEqualStrings("89abcdef01234567", txn.parent_span_id.?[0..]);
+    try testing.expectEqual(@as(?bool, true), txn.parent_sampled);
+}
+
+test "Client startTransactionFromHeaders falls back on invalid sentry-trace" {
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 0.0,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    const headers = [_]PropagationHeader{
+        .{ .name = "sentry-trace", .value = "invalid" },
+    };
+    var txn = client.startTransactionFromHeaders(.{
+        .name = "GET /fallback",
+        .op = "http.server",
+    }, &headers);
+    defer txn.deinit();
+
+    try testing.expectEqual(@as(?[16]u8, null), txn.parent_span_id);
+    try testing.expectEqual(@as(?bool, null), txn.parent_sampled);
 }
 
 test "Client sentryTraceHeader and baggageHeader include expected values" {

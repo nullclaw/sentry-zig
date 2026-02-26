@@ -1088,6 +1088,39 @@ test "CJM e2e: continued transaction keeps upstream trace identifiers" {
     try testing.expect(relay.containsInAny("\"parent_span_id\":\"89abcdef01234567\""));
 }
 
+test "CJM e2e: startTransactionFromHeaders continues upstream trace identifiers" {
+    var relay = try CaptureRelay.init(testing.allocator, &.{});
+    defer relay.deinit();
+    try relay.start();
+
+    const local_dsn = try makeLocalDsn(testing.allocator, relay.port());
+    defer testing.allocator.free(local_dsn);
+
+    const client = try sentry.init(testing.allocator, .{
+        .dsn = local_dsn,
+        .traces_sample_rate = 1.0,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    const headers = [_]sentry.PropagationHeader{
+        .{ .name = "sentry-trace", .value = "fedcba9876543210fedcba9876543210-0123456789abcdef-1" },
+    };
+    var txn = client.startTransactionFromHeaders(.{
+        .name = "GET /continued-headers",
+        .op = "http.server",
+    }, &headers);
+    defer txn.deinit();
+
+    client.finishTransaction(&txn);
+    try testing.expect(client.flush(2000));
+    try testing.expect(relay.waitForAtLeast(1, 2000));
+
+    try testing.expect(relay.containsInAny("\"type\":\"transaction\""));
+    try testing.expect(relay.containsInAny("\"trace_id\":\"fedcba9876543210fedcba9876543210\""));
+    try testing.expect(relay.containsInAny("\"parent_span_id\":\"0123456789abcdef\""));
+}
+
 test "CJM e2e: baggage sample_rate 0 drops unsampled continued transaction" {
     var relay = try CaptureRelay.init(testing.allocator, &.{});
     defer relay.deinit();

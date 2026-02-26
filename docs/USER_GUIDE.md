@@ -325,6 +325,16 @@ var txn2 = try client.startTransactionFromPropagationHeaders(
     maybe_baggage_header,
 );
 defer txn2.deinit();
+
+const headers = [_]sentry.PropagationHeader{
+    .{ .name = "sentry-trace", .value = maybe_sentry_trace_header.? },
+    .{ .name = "baggage", .value = maybe_baggage_header.? },
+};
+var txn3 = client.startTransactionFromHeaders(
+    .{ .name = "GET /orders", .op = "http.server" },
+    &headers,
+);
+defer txn3.deinit();
 ```
 
 If `baggage` contains `sentry-sample_rate` and explicit `sample_rate` is not set in
@@ -349,6 +359,7 @@ You can parse incoming baggage directly:
 const parsed_baggage = sentry.parseBaggage(incoming_baggage_header); // borrowed fields
 var parsed_baggage_owned = try sentry.parseBaggageAlloc(allocator, incoming_baggage_header); // decoded owned fields
 defer parsed_baggage_owned.deinit();
+const parsed_trace = sentry.parseHeaders(&headers);
 ```
 
 ### attach_stacktrace

@@ -93,7 +93,7 @@ exe.root_module.addImport("sentry-zig", sentry_dep.module("sentry-zig"));
 | Transactions & spans | Implemented | Sampling + trace context serialization |
 | Event context bootstrap | Implemented | Captured events receive missing `contexts.trace` + runtime/os entries while preserving custom contexts |
 | Transaction DSC envelope header | Implemented | Envelope header includes `trace_id/public_key/sample_rate/sampled` |
-| Trace propagation headers | Implemented | `sentry-trace`/`baggage` generation + incoming `sentry-trace` continuation |
+| Trace propagation headers | Implemented | `sentry-trace`/`baggage` generation + continuation from trace value, header pairs, or explicit propagation headers |
 | Traces sampler callback | Implemented | `traces_sampler` has priority over `traces_sample_rate` |
 | Sessions (application/request mode) | Implemented | Request mode disables duration tracking; payloads include session sequence (`seq`) |
 | Session distinct id (`did`) | Implemented | Derived from `Scope.user` (`id`/`email`/`username`) when available |
@@ -150,6 +150,15 @@ var txn2 = try client.startTransactionFromPropagationHeaders(
     incoming_baggage,
 );
 defer txn2.deinit();
+const headers = [_]sentry.PropagationHeader{
+    .{ .name = "sentry-trace", .value = incoming_sentry_trace.? },
+    .{ .name = "baggage", .value = incoming_baggage.? },
+};
+var txn3 = client.startTransactionFromHeaders(
+    .{ .name = "GET /orders", .op = "http.server" },
+    &headers,
+);
+defer txn3.deinit();
 // Optional explicit start timestamp (seconds, unix epoch)
 var timed_txn = client.startTransactionWithTimestamp(
     .{ .name = "GET /orders-backdated", .op = "http.server" },
@@ -170,6 +179,7 @@ fixed_span.finishWithTimestamp(1704067200.500);
 const parsed_baggage = sentry.parseBaggage(incoming_baggage);
 var parsed_baggage_owned = try sentry.parseBaggageAlloc(allocator, incoming_baggage);
 defer parsed_baggage_owned.deinit();
+const parsed_trace = sentry.parseHeaders(&headers);
 ```
 
 ```zig

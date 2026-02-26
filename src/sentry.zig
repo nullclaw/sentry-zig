@@ -56,7 +56,9 @@ pub const SentryTrace = @import("propagation.zig").SentryTrace;
 pub const DynamicSamplingContext = @import("propagation.zig").DynamicSamplingContext;
 pub const ParsedBaggage = @import("propagation.zig").ParsedBaggage;
 pub const ParsedBaggageOwned = @import("propagation.zig").ParsedBaggageOwned;
+pub const PropagationHeader = @import("propagation.zig").PropagationHeader;
 pub const parseSentryTrace = @import("propagation.zig").parseSentryTrace;
+pub const parseHeaders = @import("propagation.zig").parseHeaders;
 pub const parseBaggage = @import("propagation.zig").parseBaggage;
 pub const parseBaggageAlloc = @import("propagation.zig").parseBaggageAlloc;
 pub const formatSentryTraceAlloc = @import("propagation.zig").formatSentryTraceAlloc;
@@ -100,6 +102,11 @@ pub fn startTransactionWithTimestamp(opts: TransactionOpts, start_timestamp: f64
 pub fn startTransactionFromSentryTrace(opts: TransactionOpts, sentry_trace_header: []const u8) ?Transaction {
     const hub = Hub.current() orelse return null;
     return hub.startTransactionFromSentryTrace(opts, sentry_trace_header) catch null;
+}
+
+pub fn startTransactionFromHeaders(opts: TransactionOpts, headers: []const PropagationHeader) ?Transaction {
+    const hub = Hub.current() orelse return null;
+    return hub.startTransactionFromHeaders(opts, headers);
 }
 
 pub fn startTransactionFromPropagationHeaders(
@@ -248,6 +255,10 @@ test "global wrappers are safe no-op without current hub" {
         .{ .name = "no-hub" },
         "0123456789abcdef0123456789abcdef-89abcdef01234567-1",
     ) == null);
+    const no_hub_headers = [_]PropagationHeader{
+        .{ .name = "sentry-trace", .value = "0123456789abcdef0123456789abcdef-89abcdef01234567-1" },
+    };
+    try std.testing.expect(startTransactionFromHeaders(.{ .name = "no-hub" }, &no_hub_headers) == null);
     try std.testing.expect(startTransactionFromPropagationHeaders(
         .{ .name = "no-hub" },
         null,
@@ -332,6 +343,16 @@ test "global wrappers route through current hub" {
     ).?;
     defer continued.deinit();
     try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", continued.trace_id[0..]);
+
+    const headers = [_]PropagationHeader{
+        .{ .name = "sentry-trace", .value = "fedcba9876543210fedcba9876543210-0123456789abcdef-0" },
+    };
+    var continued_from_headers = startTransactionFromHeaders(
+        .{ .name = "GET /continued-global-headers", .op = "http.server" },
+        &headers,
+    ).?;
+    defer continued_from_headers.deinit();
+    try std.testing.expectEqualStrings("fedcba9876543210fedcba9876543210", continued_from_headers.trace_id[0..]);
 
     var baggage_only = startTransactionFromPropagationHeaders(
         .{ .name = "GET /baggage-global", .op = "http.server" },
