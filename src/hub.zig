@@ -8,6 +8,7 @@ const Client = client_mod.Client;
 const Integration = client_mod.Integration;
 const IntegrationSetupFn = client_mod.IntegrationSetupFn;
 const IntegrationLookupCallback = client_mod.IntegrationLookupCallback;
+const SendOutcome = @import("worker.zig").SendOutcome;
 const Transaction = @import("transaction.zig").Transaction;
 const TransactionOpts = @import("transaction.zig").TransactionOpts;
 const TransactionOrSpan = @import("transaction.zig").TransactionOrSpan;
@@ -319,7 +320,7 @@ pub const Hub = struct {
     }
 
     pub fn finishTransaction(self: *Hub, txn: *Transaction) void {
-        self.client.finishTransaction(txn);
+        self.client.finishTransactionWithScope(txn, self.topScope());
     }
 
     pub fn sentryTraceHeader(self: *Hub, txn: *const Transaction, allocator: Allocator) ![]u8 {
@@ -412,6 +413,29 @@ fn inspectHubIntegrationLookup(ctx: ?*anyopaque) void {
 }
 
 fn otherHubIntegrationSetup(_: *Client, _: ?*anyopaque) void {}
+
+const HubPayloadTransportState = struct {
+    allocator: Allocator,
+    sent_count: usize = 0,
+    last_payload: ?[]u8 = null,
+
+    fn init(allocator: Allocator) HubPayloadTransportState {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *HubPayloadTransportState) void {
+        if (self.last_payload) |payload| self.allocator.free(payload);
+        self.* = undefined;
+    }
+};
+
+fn hubPayloadTransportSendFn(data: []const u8, ctx: ?*anyopaque) SendOutcome {
+    const state: *HubPayloadTransportState = @ptrCast(@alignCast(ctx.?));
+    state.sent_count += 1;
+    if (state.last_payload) |payload| state.allocator.free(payload);
+    state.last_payload = state.allocator.dupe(u8, data) catch null;
+    return .{};
+}
 
 test "Hub push/pop scope isolates mutations" {
     const client = try Client.init(testing.allocator, .{
@@ -657,6 +681,51 @@ test "Hub startTransactionWithTimestamp applies explicit start timestamp" {
     defer txn.deinit();
 
     try testing.expectEqual(explicit_start, txn.start_timestamp);
+}
+
+test "Hub finishTransaction applies top scope transaction metadata" {
+    var state = HubPayloadTransportState.init(testing.allocator);
+    defer state.deinit();
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .transport = .{
+            .send_fn = hubPayloadTransportSendFn,
+            .ctx = &state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var hub = try Hub.init(testing.allocator, client);
+    defer hub.deinit();
+
+    try client.trySetTag("client-only-tag", "client");
+    try client.trySetExtra("client-only-extra", .{ .integer = 11 });
+    try client.trySetContext("client-only-context", .{ .integer = 12 });
+
+    try hub.trySetTag("hub-tag", "hub");
+    try hub.trySetExtra("hub-extra", .{ .integer = 21 });
+    try hub.trySetContext("hub-context", .{ .integer = 22 });
+
+    var txn = hub.startTransaction(.{
+        .name = "POST /hub-finish-scope",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+
+    hub.finishTransaction(&txn);
+    _ = client.flush(1000);
+
+    try testing.expectEqual(@as(usize, 1), state.sent_count);
+    try testing.expect(state.last_payload != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"hub-tag\":\"hub\"") != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"hub-extra\":21") != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"hub-context\":22") != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"client-only-tag\":\"client\"") == null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"client-only-extra\":11") == null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"client-only-context\":12") == null);
 }
 
 test "Hub TLS current set and clear" {

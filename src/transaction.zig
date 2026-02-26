@@ -353,6 +353,7 @@ pub const Transaction = struct {
     tags: std.StringHashMap([]const u8),
     extra: std.StringHashMap(json.Value),
     trace_data: std.StringHashMap(json.Value),
+    contexts: std.StringHashMap(json.Value),
     origin: ?[]u8 = null,
     request: ?json.Value = null,
     allocator: Allocator,
@@ -379,6 +380,7 @@ pub const Transaction = struct {
             .tags = std.StringHashMap([]const u8).init(allocator),
             .extra = std.StringHashMap(json.Value).init(allocator),
             .trace_data = std.StringHashMap(json.Value).init(allocator),
+            .contexts = std.StringHashMap(json.Value).init(allocator),
             .allocator = allocator,
             .sampled = opts.sampled,
             .sample_rate = opts.sample_rate,
@@ -409,6 +411,7 @@ pub const Transaction = struct {
         deinitTagMapOwned(self.allocator, &self.tags);
         deinitJsonMapOwned(self.allocator, &self.extra);
         deinitJsonMapOwned(self.allocator, &self.trace_data);
+        deinitJsonMapOwned(self.allocator, &self.contexts);
     }
 
     /// Create a child span with the same trace_id and this transaction's span_id as parent.
@@ -523,6 +526,10 @@ pub const Transaction = struct {
         try setJsonMapEntry(self.allocator, &self.trace_data, key, value);
     }
 
+    pub fn setContext(self: *Transaction, key: []const u8, value: json.Value) !void {
+        try setJsonMapEntry(self.allocator, &self.contexts, key, value);
+    }
+
     pub fn setOrigin(self: *Transaction, origin: ?[]const u8) !void {
         const replacement = if (origin) |value| try self.allocator.dupe(u8, value) else null;
         errdefer if (replacement) |value| self.allocator.free(value);
@@ -572,7 +579,7 @@ pub const Transaction = struct {
             try w.print(",\"timestamp\":{d:.3}", .{t});
         }
 
-        // Trace context
+        // Trace and additional contexts
         try w.writeAll(",\"contexts\":{\"trace\":{\"trace_id\":\"");
         try w.writeAll(&self.trace_id);
         try w.writeAll("\",\"span_id\":\"");
@@ -602,7 +609,19 @@ pub const Transaction = struct {
             try w.writeAll(",\"data\":");
             try writeJsonMapObject(w, self.trace_data);
         }
-        try w.writeAll("}}");
+        try w.writeByte('}');
+
+        if (self.contexts.count() > 0) {
+            var context_it = self.contexts.iterator();
+            while (context_it.next()) |entry| {
+                if (std.mem.eql(u8, entry.key_ptr.*, "trace")) continue;
+                try w.writeByte(',');
+                try json.Stringify.value(entry.key_ptr.*, .{}, w);
+                try w.writeByte(':');
+                try json.Stringify.value(entry.value_ptr.*, .{}, w);
+            }
+        }
+        try w.writeByte('}');
 
         if (self.tags.count() > 0) {
             try w.writeAll(",\"tags\":");
@@ -1137,6 +1156,15 @@ test "Transaction metadata setters serialize trace data tags extra and origin" {
     try txn.setTag("flow", "checkout");
     try txn.setExtra("attempt", .{ .integer = 2 });
     try txn.setData("cache_hit", .{ .bool = true });
+    var app_context: json.Value = .{ .object = blk: {
+        var obj = json.ObjectMap.init(testing.allocator);
+        const key = try testing.allocator.dupe(u8, "name");
+        const value = try testing.allocator.dupe(u8, "checkout");
+        try obj.put(key, .{ .string = value });
+        break :blk obj;
+    } };
+    defer scope_mod.deinitJsonValueDeep(testing.allocator, &app_context);
+    try txn.setContext("app", app_context);
     try txn.setOrigin("auto.http");
     txn.setName("GET /meta-renamed");
     txn.setOp("http.server.renamed");
@@ -1156,6 +1184,25 @@ test "Transaction metadata setters serialize trace data tags extra and origin" {
     try testing.expect(std.mem.indexOf(u8, json_str, "\"attempt\":2") != null);
     try testing.expect(std.mem.indexOf(u8, json_str, "\"data\":{") != null);
     try testing.expect(std.mem.indexOf(u8, json_str, "\"cache_hit\":true") != null);
+    try testing.expect(std.mem.indexOf(u8, json_str, "\"app\":{") != null);
+    try testing.expect(std.mem.indexOf(u8, json_str, "\"name\":\"checkout\"") != null);
+}
+
+test "Transaction setContext does not override trace context" {
+    var txn = Transaction.init(testing.allocator, .{
+        .name = "GET /trace-context",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+
+    try txn.setContext("trace", .{ .string = "invalid-trace-context" });
+    txn.finish();
+
+    const json_str = try txn.toJson(testing.allocator);
+    defer testing.allocator.free(json_str);
+
+    try testing.expect(std.mem.indexOf(u8, json_str, "\"contexts\":{\"trace\":{\"trace_id\":\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json_str, "\"trace\":\"invalid-trace-context\"") == null);
 }
 
 test "Span metadata setters serialize tags and data" {

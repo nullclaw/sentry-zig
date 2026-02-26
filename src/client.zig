@@ -793,7 +793,14 @@ pub const Client = struct {
 
     /// Finish a transaction, serialize it, and submit the envelope to the worker.
     pub fn finishTransaction(self: *Client, txn: *Transaction) void {
+        self.finishTransactionWithScope(txn, &self.scope);
+    }
+
+    /// Finish a transaction using an explicit scope for transaction enrichment.
+    pub fn finishTransactionWithScope(self: *Client, txn: *Transaction, source_scope: *Scope) void {
         if (!self.isEnabled()) return;
+
+        source_scope.applyToTransaction(txn) catch return;
 
         txn.finish();
 
@@ -2089,6 +2096,41 @@ test "Client explicit transaction dist takes precedence over option dist" {
     try testing.expectEqual(@as(usize, 1), state.sent_count);
     try testing.expect(state.last_payload != null);
     try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"dist\":\"custom\"") != null);
+}
+
+test "Client finishTransaction applies scope tags extra and contexts" {
+    var state = PayloadTransportState.init(testing.allocator);
+    defer state.deinit();
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .transport = .{
+            .send_fn = payloadTransportSendFn,
+            .ctx = &state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    try client.trySetTag("scope-flow", "checkout");
+    try client.trySetExtra("scope-attempt", .{ .integer = 3 });
+    try client.trySetContext("scope-context", .{ .integer = 9 });
+
+    var txn = client.startTransaction(.{
+        .name = "POST /scope-transaction",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+
+    client.finishTransaction(&txn);
+    _ = client.flush(1000);
+
+    try testing.expectEqual(@as(usize, 1), state.sent_count);
+    try testing.expect(state.last_payload != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"scope-flow\":\"checkout\"") != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"scope-attempt\":3") != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"scope-context\":9") != null);
 }
 
 test "Client serializeLogEnvelope writes log item type" {

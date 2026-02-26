@@ -756,6 +756,41 @@ test "CJM e2e: transaction metadata setters serialize trace data tags and extras
     try testing.expect(relay.containsInAny("\"rows\":1"));
 }
 
+test "CJM e2e: client scope enriches transaction metadata" {
+    var relay = try CaptureRelay.init(testing.allocator, &.{});
+    defer relay.deinit();
+    try relay.start();
+
+    const local_dsn = try makeLocalDsn(testing.allocator, relay.port());
+    defer testing.allocator.free(local_dsn);
+
+    const client = try sentry.init(testing.allocator, .{
+        .dsn = local_dsn,
+        .traces_sample_rate = 1.0,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    try client.trySetTag("scope-flow", "checkout");
+    try client.trySetExtra("scope-attempt", .{ .integer = 4 });
+    try client.trySetContext("scope-context", .{ .integer = 8 });
+
+    var txn = client.startTransaction(.{
+        .name = "POST /checkout-scope",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+
+    client.finishTransaction(&txn);
+    try testing.expect(client.flush(2000));
+    try testing.expect(relay.waitForAtLeast(1, 2000));
+
+    try testing.expect(relay.containsInAny("\"type\":\"transaction\""));
+    try testing.expect(relay.containsInAny("\"scope-flow\":\"checkout\""));
+    try testing.expect(relay.containsInAny("\"scope-attempt\":4"));
+    try testing.expect(relay.containsInAny("\"scope-context\":8"));
+}
+
 test "CJM e2e: transaction and span request metadata is serialized" {
     var relay = try CaptureRelay.init(testing.allocator, &.{});
     defer relay.deinit();

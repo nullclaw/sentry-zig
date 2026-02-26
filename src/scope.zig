@@ -742,6 +742,28 @@ pub const Scope = struct {
         return out;
     }
 
+    /// Apply scope tags/extra/contexts to a transaction-like object.
+    /// The transaction must provide `setTag`, `setExtra`, and `setContext`.
+    pub fn applyToTransaction(self: *Scope, transaction: anytype) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var tag_it = self.tags.iterator();
+        while (tag_it.next()) |entry| {
+            try transaction.setTag(entry.key_ptr.*, entry.value_ptr.*);
+        }
+
+        var extra_it = self.extra.iterator();
+        while (extra_it.next()) |entry| {
+            try transaction.setExtra(entry.key_ptr.*, entry.value_ptr.*);
+        }
+
+        var context_it = self.contexts.iterator();
+        while (context_it.next()) |entry| {
+            try transaction.setContext(entry.key_ptr.*, entry.value_ptr.*);
+        }
+    }
+
     /// Apply scope data to an event before sending.
     pub fn applyToEvent(self: *Scope, allocator: Allocator, event: *Event) !ApplyResult {
         var result: ApplyResult = .{};
@@ -1168,6 +1190,133 @@ test "Scope applyToEvent sets transaction and fingerprint and restores on cleanu
     cleanupAppliedToEvent(testing.allocator, &event, applied);
     try testing.expect(event.transaction == null);
     try testing.expect(event.fingerprint == null);
+}
+
+const ScopeTransactionProbe = struct {
+    allocator: Allocator,
+    tags: std.StringHashMap([]const u8),
+    extra: std.StringHashMap(json.Value),
+    contexts: std.StringHashMap(json.Value),
+
+    fn init(allocator: Allocator) ScopeTransactionProbe {
+        return .{
+            .allocator = allocator,
+            .tags = std.StringHashMap([]const u8).init(allocator),
+            .extra = std.StringHashMap(json.Value).init(allocator),
+            .contexts = std.StringHashMap(json.Value).init(allocator),
+        };
+    }
+
+    fn deinit(self: *ScopeTransactionProbe) void {
+        var tag_it = self.tags.iterator();
+        while (tag_it.next()) |entry| {
+            self.allocator.free(@constCast(entry.key_ptr.*));
+            self.allocator.free(@constCast(entry.value_ptr.*));
+        }
+        self.tags.deinit();
+
+        var extra_it = self.extra.iterator();
+        while (extra_it.next()) |entry| {
+            self.allocator.free(@constCast(entry.key_ptr.*));
+            deinitJsonValueDeep(self.allocator, entry.value_ptr);
+        }
+        self.extra.deinit();
+
+        var context_it = self.contexts.iterator();
+        while (context_it.next()) |entry| {
+            self.allocator.free(@constCast(entry.key_ptr.*));
+            deinitJsonValueDeep(self.allocator, entry.value_ptr);
+        }
+        self.contexts.deinit();
+    }
+
+    fn setTag(self: *ScopeTransactionProbe, key: []const u8, value: []const u8) !void {
+        const key_copy = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(key_copy);
+        const value_copy = try self.allocator.dupe(u8, value);
+        errdefer self.allocator.free(value_copy);
+
+        if (self.tags.fetchRemove(key)) |kv| {
+            self.allocator.free(@constCast(kv.key));
+            self.allocator.free(@constCast(kv.value));
+        }
+
+        try self.tags.put(key_copy, value_copy);
+    }
+
+    fn setExtra(self: *ScopeTransactionProbe, key: []const u8, value: json.Value) !void {
+        const key_copy = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(key_copy);
+        var value_copy = try cloneJsonValue(self.allocator, value);
+        errdefer deinitJsonValueDeep(self.allocator, &value_copy);
+
+        if (self.extra.fetchRemove(key)) |kv| {
+            self.allocator.free(@constCast(kv.key));
+            var old = kv.value;
+            deinitJsonValueDeep(self.allocator, &old);
+        }
+
+        try self.extra.put(key_copy, value_copy);
+    }
+
+    fn setContext(self: *ScopeTransactionProbe, key: []const u8, value: json.Value) !void {
+        const key_copy = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(key_copy);
+        var value_copy = try cloneJsonValue(self.allocator, value);
+        errdefer deinitJsonValueDeep(self.allocator, &value_copy);
+
+        if (self.contexts.fetchRemove(key)) |kv| {
+            self.allocator.free(@constCast(kv.key));
+            var old = kv.value;
+            deinitJsonValueDeep(self.allocator, &old);
+        }
+
+        try self.contexts.put(key_copy, value_copy);
+    }
+};
+
+const FailingTransactionSink = struct {
+    fn setTag(_: *FailingTransactionSink, _: []const u8, _: []const u8) !void {
+        return error.OutOfMemory;
+    }
+
+    fn setExtra(_: *FailingTransactionSink, _: []const u8, _: json.Value) !void {}
+
+    fn setContext(_: *FailingTransactionSink, _: []const u8, _: json.Value) !void {}
+};
+
+test "Scope applyToTransaction copies tags extra and contexts" {
+    var scope = try Scope.init(testing.allocator, 10);
+    defer scope.deinit();
+
+    try scope.setTag("flow", "checkout");
+    try scope.setExtra("attempt", .{ .integer = 2 });
+    try scope.setContext("app", .{ .integer = 42 });
+
+    var probe = ScopeTransactionProbe.init(testing.allocator);
+    defer probe.deinit();
+
+    try scope.applyToTransaction(&probe);
+
+    try testing.expectEqualStrings("checkout", probe.tags.get("flow").?);
+
+    const extra = probe.extra.get("attempt").?;
+    try testing.expect(extra == .integer);
+    try testing.expectEqual(@as(i64, 2), extra.integer);
+
+    const context = probe.contexts.get("app").?;
+    try testing.expect(context == .integer);
+    try testing.expectEqual(@as(i64, 42), context.integer);
+}
+
+test "Scope applyToTransaction propagates transaction sink errors" {
+    var scope = try Scope.init(testing.allocator, 10);
+    defer scope.deinit();
+
+    try scope.setTag("flow", "checkout");
+
+    var sink = FailingTransactionSink{};
+    try testing.expectError(error.OutOfMemory, scope.applyToTransaction(&sink));
 }
 
 test "Scope stores owned tag strings" {
