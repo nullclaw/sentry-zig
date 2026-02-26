@@ -61,6 +61,13 @@ exe.root_module.addImport("sentry-zig", sentry_dep.module("sentry-zig"));
 - `Session`: release health lifecycle (`startSession`, `endSession`).
 - `MonitorCheckIn`: cron monitor status payload (`captureCheckIn`).
 
+## Zig-First API
+
+- Most mutating API calls have both forms:
+- ergonomic (`setTag`, `addBreadcrumb`, `addAttachment`) that never fail outwardly.
+- explicit fallible (`trySetTag`, `tryAddBreadcrumb`, `tryAddAttachment`) for strict error handling.
+- Use `try*` methods when you want full control over `OutOfMemory` and other allocation failures.
+
 ## Feature Status
 
 | Capability | Status | Notes |

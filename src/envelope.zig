@@ -12,6 +12,35 @@ const ts = @import("timestamp.zig");
 pub const SDK_NAME = "sentry-zig";
 pub const SDK_VERSION = "0.1.0";
 
+fn writeEnvelopeHeader(writer: *Writer, dsn: Dsn, event_id: ?[]const u8) !void {
+    try writer.writeByte('{');
+    if (event_id) |id| {
+        try writer.writeAll("\"event_id\":\"");
+        try writer.writeAll(id);
+        try writer.writeAll("\",");
+    }
+    try writer.writeAll("\"dsn\":\"");
+    try dsn.writeDsn(writer);
+    try writer.writeAll("\",\"sent_at\":\"");
+    const rfc3339 = ts.nowRfc3339();
+    try writer.writeAll(&rfc3339);
+    try writer.writeAll("\",\"sdk\":{\"name\":\"");
+    try writer.writeAll(SDK_NAME);
+    try writer.writeAll("\",\"version\":\"");
+    try writer.writeAll(SDK_VERSION);
+    try writer.writeAll("\"}}");
+    try writer.writeByte('\n');
+}
+
+fn writeItemHeader(writer: *Writer, item_type: []const u8, payload_len: usize) !void {
+    try writer.writeAll("{\"type\":");
+    try json.Stringify.value(item_type, .{}, writer);
+    try writer.writeAll(",\"length\":");
+    try writer.print("{d}", .{payload_len});
+    try writer.writeByte('}');
+    try writer.writeByte('\n');
+}
+
 /// Serialize a complete event envelope.
 ///
 /// The Sentry envelope format is newline-delimited:
@@ -38,26 +67,8 @@ pub fn serializeEventEnvelopeWithAttachments(
     );
     defer allocator.free(payload);
 
-    // Envelope header line
-    try writer.writeAll("{\"event_id\":\"");
-    try writer.writeAll(&event.event_id);
-    try writer.writeAll("\",\"dsn\":\"");
-    try dsn.writeDsn(writer);
-    try writer.writeAll("\",\"sent_at\":\"");
-    const rfc3339 = ts.nowRfc3339();
-    try writer.writeAll(&rfc3339);
-    try writer.writeAll("\",\"sdk\":{\"name\":\"");
-    try writer.writeAll(SDK_NAME);
-    try writer.writeAll("\",\"version\":\"");
-    try writer.writeAll(SDK_VERSION);
-    try writer.writeAll("\"}}");
-    try writer.writeByte('\n');
-
-    // Item header line
-    try writer.writeAll("{\"type\":\"event\",\"length\":");
-    try writer.print("{d}", .{payload.len});
-    try writer.writeByte('}');
-    try writer.writeByte('\n');
+    try writeEnvelopeHeader(writer, dsn, &event.event_id);
+    try writeItemHeader(writer, "event", payload.len);
 
     // Event payload
     try writer.writeAll(payload);
@@ -89,52 +100,28 @@ pub fn serializeEventEnvelopeWithAttachments(
 ///
 /// Session envelopes do not include event_id in the header.
 pub fn serializeSessionEnvelope(dsn: Dsn, session_json: []const u8, writer: *Writer) !void {
-    // Envelope header line (no event_id for sessions)
-    try writer.writeAll("{\"dsn\":\"");
-    try dsn.writeDsn(writer);
-    try writer.writeAll("\",\"sent_at\":\"");
-    const rfc3339 = ts.nowRfc3339();
-    try writer.writeAll(&rfc3339);
-    try writer.writeAll("\",\"sdk\":{\"name\":\"");
-    try writer.writeAll(SDK_NAME);
-    try writer.writeAll("\",\"version\":\"");
-    try writer.writeAll(SDK_VERSION);
-    try writer.writeAll("\"}}");
-    try writer.writeByte('\n');
-
-    // Item header line
-    try writer.writeAll("{\"type\":\"session\",\"length\":");
-    try writer.print("{d}", .{session_json.len});
-    try writer.writeByte('}');
-    try writer.writeByte('\n');
-
-    // Payload
+    try writeEnvelopeHeader(writer, dsn, null);
+    try writeItemHeader(writer, "session", session_json.len);
     try writer.writeAll(session_json);
 }
 
 /// Serialize a monitor check-in envelope.
 pub fn serializeCheckInEnvelope(dsn: Dsn, check_in_json: []const u8, writer: *Writer) !void {
-    // Envelope header line (no event_id for check-ins)
-    try writer.writeAll("{\"dsn\":\"");
-    try dsn.writeDsn(writer);
-    try writer.writeAll("\",\"sent_at\":\"");
-    const rfc3339 = ts.nowRfc3339();
-    try writer.writeAll(&rfc3339);
-    try writer.writeAll("\",\"sdk\":{\"name\":\"");
-    try writer.writeAll(SDK_NAME);
-    try writer.writeAll("\",\"version\":\"");
-    try writer.writeAll(SDK_VERSION);
-    try writer.writeAll("\"}}");
-    try writer.writeByte('\n');
+    try writeEnvelopeHeader(writer, dsn, null);
+    try writeItemHeader(writer, "check_in", check_in_json.len);
 
-    // Item header line
-    try writer.writeAll("{\"type\":\"check_in\",\"length\":");
-    try writer.print("{d}", .{check_in_json.len});
-    try writer.writeByte('}');
-    try writer.writeByte('\n');
-
-    // Payload
     try writer.writeAll(check_in_json);
+}
+
+pub fn serializeTransactionEnvelope(
+    dsn: Dsn,
+    event_id: [32]u8,
+    transaction_json: []const u8,
+    writer: *Writer,
+) !void {
+    try writeEnvelopeHeader(writer, dsn, &event_id);
+    try writeItemHeader(writer, "transaction", transaction_json.len);
+    try writer.writeAll(transaction_json);
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -287,4 +274,30 @@ test "serializeCheckInEnvelope produces valid format" {
     try testing.expect(std.mem.indexOf(u8, line1, "\"dsn\"") != null);
     try testing.expect(std.mem.indexOf(u8, line2, "\"type\":\"check_in\"") != null);
     try testing.expectEqualStrings(check_in_json, line3);
+}
+
+test "serializeTransactionEnvelope produces valid format" {
+    const dsn = try Dsn.parse("https://key@sentry.example.com/42");
+    const transaction_json = "{\"type\":\"transaction\",\"transaction\":\"GET /health\"}";
+    const event_id = [_]u8{
+        '0', '1', '2', '3', '4', '5', '6', '7',
+        '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
+        '0', '1', '2', '3', '4', '5', '6', '7',
+        '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
+    };
+
+    var aw: Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+
+    try serializeTransactionEnvelope(dsn, event_id, transaction_json, &aw.writer);
+    const output = aw.written();
+
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    const line1 = lines.next().?;
+    const line2 = lines.next().?;
+    const line3 = lines.rest();
+
+    try testing.expect(std.mem.indexOf(u8, line1, "\"event_id\"") != null);
+    try testing.expect(std.mem.indexOf(u8, line2, "\"type\":\"transaction\"") != null);
+    try testing.expectEqualStrings(transaction_json, line3);
 }

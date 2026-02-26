@@ -137,6 +137,11 @@ client.removeContext("region");
 - `setLevel` задаёт level по умолчанию.
 - `setTransaction` и `setFingerprint` влияют на группировку событий.
 
+Для строгого Zig-style error handling доступны fallible-версии:
+- `trySetUser`, `trySetTag`, `trySetExtra`, `trySetContext`
+- `trySetTransaction`, `trySetFingerprint`
+- `tryAddBreadcrumb`, `tryAddAttachment`, `tryAddEventProcessor`
+
 ## Attachments
 
 ### Из памяти

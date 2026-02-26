@@ -376,6 +376,11 @@ pub const Scope = struct {
 
     /// Set the user context (thread-safe).
     pub fn setUser(self: *Scope, user: ?User) void {
+        self.trySetUser(user) catch {};
+    }
+
+    /// Set the user context and surface allocation failures.
+    pub fn trySetUser(self: *Scope, user: ?User) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -385,7 +390,7 @@ pub const Scope = struct {
         }
 
         if (user) |u| {
-            self.user = cloneUser(self.allocator, u) catch null;
+            self.user = try cloneUser(self.allocator, u);
         }
     }
 
@@ -521,10 +526,15 @@ pub const Scope = struct {
 
     /// Add a breadcrumb (thread-safe).
     pub fn addBreadcrumb(self: *Scope, crumb: Breadcrumb) void {
+        self.tryAddBreadcrumb(crumb) catch {};
+    }
+
+    /// Add a breadcrumb and surface allocation failures.
+    pub fn tryAddBreadcrumb(self: *Scope, crumb: Breadcrumb) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        var owned = cloneBreadcrumb(self.allocator, crumb) catch return;
+        var owned = try cloneBreadcrumb(self.allocator, crumb);
         if (owned.timestamp == null) {
             owned.timestamp = ts.now();
         }
@@ -533,13 +543,17 @@ pub const Scope = struct {
 
     /// Add an attachment to the scope. The scope stores an owned clone.
     pub fn addAttachment(self: *Scope, attachment: Attachment) void {
+        self.tryAddAttachment(attachment) catch {};
+    }
+
+    /// Add an attachment to the scope and surface allocation failures.
+    pub fn tryAddAttachment(self: *Scope, attachment: Attachment) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        var owned = attachment.clone(self.allocator) catch return;
-        self.attachments.append(self.allocator, owned) catch {
-            owned.deinit(self.allocator);
-        };
+        var owned = try attachment.clone(self.allocator);
+        errdefer owned.deinit(self.allocator);
+        try self.attachments.append(self.allocator, owned);
     }
 
     /// Clear scope attachments.

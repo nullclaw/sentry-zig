@@ -17,6 +17,7 @@ pub const Transport = struct {
     allocator: Allocator,
     dsn: Dsn,
     envelope_url: []u8, // allocated
+    envelope_uri: std.Uri,
     user_agent: []u8, // allocated
     http_client: std.http.Client,
 
@@ -26,12 +27,14 @@ pub const Transport = struct {
         defer allocator.free(base_url);
         const envelope_url = try std.fmt.allocPrint(allocator, "{s}?sentry_key={s}", .{ base_url, dsn.public_key });
         errdefer allocator.free(envelope_url);
+        const envelope_uri = try std.Uri.parse(envelope_url);
 
         const user_agent_copy = try allocator.dupe(u8, user_agent);
         return Transport{
             .allocator = allocator,
             .dsn = dsn,
             .envelope_url = envelope_url,
+            .envelope_uri = envelope_uri,
             .user_agent = user_agent_copy,
             .http_client = .{ .allocator = allocator },
         };
@@ -47,8 +50,7 @@ pub const Transport = struct {
 
     /// Send envelope data to the Sentry endpoint via HTTP POST.
     pub fn send(self: *Transport, envelope_data: []const u8) !SendResult {
-        const uri = try std.Uri.parse(self.envelope_url);
-        var req = try self.http_client.request(.POST, uri, .{
+        var req = try self.http_client.request(.POST, self.envelope_uri, .{
             .redirect_behavior = .unhandled,
             .extra_headers = &.{
                 .{ .name = "Content-Type", .value = "application/x-sentry-envelope" },

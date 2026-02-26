@@ -94,13 +94,16 @@ pub const Client = struct {
         var scope = try Scope.init(allocator, options.max_breadcrumbs);
         errdefer scope.deinit();
 
+        var worker = try Worker.init(allocator, transportSendCallback, @ptrCast(self));
+        errdefer worker.deinit();
+
         self.* = Client{
             .allocator = allocator,
             .dsn = dsn,
             .options = options,
             .scope = scope,
             .transport = transport,
-            .worker = Worker.init(allocator, transportSendCallback, @ptrCast(self)),
+            .worker = worker,
             .session = null,
             .last_event_id = null,
         };
@@ -276,7 +279,12 @@ pub const Client = struct {
 
     /// Set the user context.
     pub fn setUser(self: *Client, user: User) void {
-        self.scope.setUser(user);
+        self.trySetUser(user) catch {};
+    }
+
+    /// Set the user context and surface allocation failures.
+    pub fn trySetUser(self: *Client, user: User) !void {
+        try self.scope.trySetUser(user);
     }
 
     /// Remove the user context.
@@ -286,7 +294,12 @@ pub const Client = struct {
 
     /// Set a tag.
     pub fn setTag(self: *Client, key: []const u8, value: []const u8) void {
-        self.scope.setTag(key, value) catch {};
+        self.trySetTag(key, value) catch {};
+    }
+
+    /// Set a tag and surface allocation failures.
+    pub fn trySetTag(self: *Client, key: []const u8, value: []const u8) !void {
+        try self.scope.setTag(key, value);
     }
 
     /// Set the default level for events in the current scope.
@@ -296,12 +309,22 @@ pub const Client = struct {
 
     /// Set transaction name override on scope.
     pub fn setTransaction(self: *Client, transaction: ?[]const u8) void {
-        self.scope.setTransaction(transaction) catch {};
+        self.trySetTransaction(transaction) catch {};
+    }
+
+    /// Set transaction name override on scope and surface allocation failures.
+    pub fn trySetTransaction(self: *Client, transaction: ?[]const u8) !void {
+        try self.scope.setTransaction(transaction);
     }
 
     /// Set fingerprint override on scope.
     pub fn setFingerprint(self: *Client, fingerprint: ?[]const []const u8) void {
-        self.scope.setFingerprint(fingerprint) catch {};
+        self.trySetFingerprint(fingerprint) catch {};
+    }
+
+    /// Set fingerprint override on scope and surface allocation failures.
+    pub fn trySetFingerprint(self: *Client, fingerprint: ?[]const []const u8) !void {
+        try self.scope.setFingerprint(fingerprint);
     }
 
     /// Remove a tag.
@@ -311,28 +334,48 @@ pub const Client = struct {
 
     /// Set an extra value.
     pub fn setExtra(self: *Client, key: []const u8, value: json.Value) void {
-        self.scope.setExtra(key, value) catch {};
+        self.trySetExtra(key, value) catch {};
+    }
+
+    /// Set an extra value and surface allocation failures.
+    pub fn trySetExtra(self: *Client, key: []const u8, value: json.Value) !void {
+        try self.scope.setExtra(key, value);
     }
 
     /// Set a context value.
     pub fn setContext(self: *Client, key: []const u8, value: json.Value) void {
-        self.scope.setContext(key, value) catch {};
+        self.trySetContext(key, value) catch {};
+    }
+
+    /// Set a context value and surface allocation failures.
+    pub fn trySetContext(self: *Client, key: []const u8, value: json.Value) !void {
+        try self.scope.setContext(key, value);
     }
 
     /// Add a breadcrumb.
     pub fn addBreadcrumb(self: *Client, crumb: Breadcrumb) void {
+        self.tryAddBreadcrumb(crumb) catch {};
+    }
+
+    /// Add a breadcrumb and surface allocation failures.
+    pub fn tryAddBreadcrumb(self: *Client, crumb: Breadcrumb) !void {
         if (self.options.before_breadcrumb) |before_breadcrumb| {
             if (before_breadcrumb(crumb)) |processed| {
-                self.scope.addBreadcrumb(processed);
+                try self.scope.tryAddBreadcrumb(processed);
             }
             return;
         }
-        self.scope.addBreadcrumb(crumb);
+        try self.scope.tryAddBreadcrumb(crumb);
     }
 
     /// Add an attachment to the scope for future captured events.
     pub fn addAttachment(self: *Client, attachment: Attachment) void {
-        self.scope.addAttachment(attachment);
+        self.tryAddAttachment(attachment) catch {};
+    }
+
+    /// Add an attachment to the scope and surface allocation failures.
+    pub fn tryAddAttachment(self: *Client, attachment: Attachment) !void {
+        try self.scope.tryAddAttachment(attachment);
     }
 
     /// Clear all attachments from the scope.
@@ -342,7 +385,12 @@ pub const Client = struct {
 
     /// Add a scope event processor. Returning false drops the event.
     pub fn addEventProcessor(self: *Client, processor: scope_mod.EventProcessor) void {
-        self.scope.addEventProcessor(processor) catch {};
+        self.tryAddEventProcessor(processor) catch {};
+    }
+
+    /// Add a scope event processor and surface allocation failures.
+    pub fn tryAddEventProcessor(self: *Client, processor: scope_mod.EventProcessor) !void {
+        try self.scope.addEventProcessor(processor);
     }
 
     /// Remove all scope event processors.
@@ -413,7 +461,7 @@ pub const Client = struct {
         defer self.allocator.free(txn_json);
 
         // Create transaction envelope
-        const data = self.serializeTransactionEnvelope(txn, txn_json) catch return;
+        const data = self.serializeTransactionEnvelope(txn_json, txn.event_id) catch return;
 
         self.worker.submit(data, .transaction) catch {
             self.allocator.free(data);
@@ -536,35 +584,10 @@ pub const Client = struct {
         return try aw.toOwnedSlice();
     }
 
-    fn serializeTransactionEnvelope(self: *Client, txn: *const Transaction, txn_json: []const u8) ![]u8 {
+    fn serializeTransactionEnvelope(self: *Client, txn_json: []const u8, event_id: [32]u8) ![]u8 {
         var aw: Writer.Allocating = .init(self.allocator);
         errdefer aw.deinit();
-        const w = &aw.writer;
-
-        // Envelope header
-        try w.writeAll("{\"event_id\":\"");
-        try w.writeAll(&txn.event_id);
-        try w.writeAll("\",\"dsn\":\"");
-        try self.dsn.writeDsn(w);
-        try w.writeAll("\",\"sent_at\":\"");
-        const ts = @import("timestamp.zig");
-        const rfc3339 = ts.nowRfc3339();
-        try w.writeAll(&rfc3339);
-        try w.writeAll("\",\"sdk\":{\"name\":\"");
-        try w.writeAll(envelope.SDK_NAME);
-        try w.writeAll("\",\"version\":\"");
-        try w.writeAll(envelope.SDK_VERSION);
-        try w.writeAll("\"}}");
-        try w.writeByte('\n');
-
-        // Item header
-        try w.writeAll("{\"type\":\"transaction\",\"length\":");
-        try w.print("{d}", .{txn_json.len});
-        try w.writeByte('}');
-        try w.writeByte('\n');
-
-        // Payload
-        try w.writeAll(txn_json);
+        try envelope.serializeTransactionEnvelope(self.dsn, event_id, txn_json, &aw.writer);
 
         return try aw.toOwnedSlice();
     }
@@ -711,6 +734,42 @@ test "Client addAttachment stores attachment in scope" {
 
     client.clearAttachments();
     try testing.expectEqual(@as(usize, 0), client.scope.attachments.items.len);
+}
+
+fn keepEventProcessor(_: *Event) bool {
+    return true;
+}
+
+test "Client try* scope mutators expose fallible API" {
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    try client.trySetUser(.{ .id = "user-42", .email = "u@example.com" });
+    try client.trySetTag("region", "us-east-1");
+    try client.trySetExtra("attempt", .{ .integer = 3 });
+    try client.trySetContext("runtime", .{ .string = "zig" });
+    try client.trySetTransaction("GET /checkout");
+    try client.trySetFingerprint(&.{ "checkout", "timeout" });
+    try client.tryAddBreadcrumb(.{ .message = "checkout-started", .category = "flow" });
+
+    var attachment = try Attachment.initOwned(
+        testing.allocator,
+        "diag.txt",
+        "payload",
+        "text/plain",
+        null,
+    );
+    defer attachment.deinit(testing.allocator);
+    try client.tryAddAttachment(attachment);
+    try client.tryAddEventProcessor(keepEventProcessor);
+
+    try testing.expect(client.scope.user != null);
+    try testing.expectEqualStrings("us-east-1", client.scope.tags.get("region").?);
+    try testing.expectEqual(@as(usize, 1), client.scope.attachments.items.len);
+    try testing.expectEqual(@as(usize, 1), client.scope.event_processors.items.len);
 }
 
 test "Client serializeCheckInEnvelope writes check_in item type" {
