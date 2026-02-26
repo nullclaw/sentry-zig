@@ -32,6 +32,7 @@ const MonitorCheckIn = @import("monitor.zig").MonitorCheckIn;
 const txn_mod = @import("transaction.zig");
 const Transaction = txn_mod.Transaction;
 const TransactionOpts = txn_mod.TransactionOpts;
+const TransactionOrSpan = txn_mod.TransactionOrSpan;
 const Uuid = @import("uuid.zig").Uuid;
 const log_mod = @import("log.zig");
 const LogEntry = log_mod.LogEntry;
@@ -712,6 +713,30 @@ pub const Client = struct {
             txn.incoming_baggage = try self.allocator.dupe(u8, baggage);
         }
         return txn;
+    }
+
+    /// Start a transaction from an existing transaction/span context.
+    pub fn startTransactionFromSpan(
+        self: *Client,
+        opts: TransactionOpts,
+        source: ?TransactionOrSpan,
+    ) Transaction {
+        var real_opts = opts;
+        if (source) |value| {
+            switch (value) {
+                .transaction => |txn| {
+                    real_opts.parent_trace_id = txn.trace_id;
+                    real_opts.parent_span_id = txn.span_id;
+                    real_opts.parent_sampled = txn.sampled;
+                },
+                .span => |span| {
+                    real_opts.parent_trace_id = span.trace_id;
+                    real_opts.parent_span_id = span.span_id;
+                    real_opts.parent_sampled = span.sampled;
+                },
+            }
+        }
+        return self.startTransaction(real_opts);
     }
 
     /// Start a transaction by scanning raw headers for `sentry-trace`
@@ -2465,6 +2490,59 @@ test "Client startTransactionFromHeaders falls back on invalid sentry-trace" {
 
     try testing.expectEqual(@as(?[16]u8, null), txn.parent_span_id);
     try testing.expectEqual(@as(?bool, null), txn.parent_sampled);
+}
+
+test "Client startTransactionFromSpan continues from transaction context" {
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var parent = client.startTransaction(.{
+        .name = "GET /parent",
+        .op = "http.server",
+    });
+    defer parent.deinit();
+
+    var child = client.startTransactionFromSpan(.{
+        .name = "GET /continued",
+        .op = "http.server",
+    }, .{ .transaction = &parent });
+    defer child.deinit();
+
+    try testing.expectEqualSlices(u8, parent.trace_id[0..], child.trace_id[0..]);
+    try testing.expect(child.parent_span_id != null);
+    try testing.expectEqualSlices(u8, parent.span_id[0..], child.parent_span_id.?[0..]);
+    try testing.expectEqual(@as(?bool, true), child.parent_sampled);
+}
+
+test "Client startTransactionFromSpan continues from span context" {
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var parent = client.startTransaction(.{
+        .name = "GET /parent",
+        .op = "http.server",
+    });
+    defer parent.deinit();
+
+    const span = try parent.startChild(.{ .op = "db.query" });
+    var child = client.startTransactionFromSpan(.{
+        .name = "GET /continued-from-span",
+        .op = "http.server",
+    }, .{ .span = span });
+    defer child.deinit();
+
+    try testing.expectEqualSlices(u8, parent.trace_id[0..], child.trace_id[0..]);
+    try testing.expect(child.parent_span_id != null);
+    try testing.expectEqualSlices(u8, span.span_id[0..], child.parent_span_id.?[0..]);
+    try testing.expectEqual(@as(?bool, true), child.parent_sampled);
 }
 
 test "Client sentryTraceHeader and baggageHeader include expected values" {

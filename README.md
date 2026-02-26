@@ -159,6 +159,11 @@ var txn3 = client.startTransactionFromHeaders(
     &headers,
 );
 defer txn3.deinit();
+var txn4 = client.startTransactionFromSpan(
+    .{ .name = "GET /orders-fanout", .op = "worker" },
+    .{ .transaction = &txn2 },
+);
+defer txn4.deinit();
 // Optional explicit start timestamp (seconds, unix epoch)
 var timed_txn = client.startTransactionWithTimestamp(
     .{ .name = "GET /orders-backdated", .op = "http.server" },

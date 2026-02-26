@@ -351,6 +351,12 @@ var txn3 = client.startTransactionFromHeaders(
     &headers,
 );
 defer txn3.deinit();
+
+var txn4 = client.startTransactionFromSpan(
+    .{ .name = "GET /orders-fanout", .op = "worker" },
+    .{ .transaction = &txn2 },
+);
+defer txn4.deinit();
 ```
 
 If `baggage` contains `sentry-sample_rate` and explicit `sample_rate` is not set in

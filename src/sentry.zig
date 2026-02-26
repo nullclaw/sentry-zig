@@ -39,6 +39,7 @@ pub const TransactionOpts = @import("transaction.zig").TransactionOpts;
 pub const ChildSpanOpts = @import("transaction.zig").ChildSpanOpts;
 pub const Span = @import("transaction.zig").Span;
 pub const SpanStatus = @import("transaction.zig").SpanStatus;
+pub const TransactionOrSpan = @import("transaction.zig").TransactionOrSpan;
 pub const MAX_SPANS = @import("transaction.zig").MAX_SPANS;
 pub const Session = @import("session.zig").Session;
 pub const SessionStatus = @import("session.zig").SessionStatus;
@@ -109,6 +110,11 @@ pub fn startTransactionFromSentryTrace(opts: TransactionOpts, sentry_trace_heade
 pub fn startTransactionFromHeaders(opts: TransactionOpts, headers: []const PropagationHeader) ?Transaction {
     const hub = Hub.current() orelse return null;
     return hub.startTransactionFromHeaders(opts, headers);
+}
+
+pub fn startTransactionFromSpan(opts: TransactionOpts, source: ?TransactionOrSpan) ?Transaction {
+    const hub = Hub.current() orelse return null;
+    return hub.startTransactionFromSpan(opts, source);
 }
 
 pub fn startTransactionFromPropagationHeaders(
@@ -295,6 +301,7 @@ test "global wrappers are safe no-op without current hub" {
         .{ .name = "sentry-trace", .value = "0123456789abcdef0123456789abcdef-89abcdef01234567-1" },
     };
     try std.testing.expect(startTransactionFromHeaders(.{ .name = "no-hub" }, &no_hub_headers) == null);
+    try std.testing.expect(startTransactionFromSpan(.{ .name = "no-hub" }, null) == null);
     try std.testing.expect(startTransactionFromPropagationHeaders(
         .{ .name = "no-hub" },
         null,
@@ -406,6 +413,13 @@ test "global wrappers route through current hub" {
     ).?;
     defer continued_from_headers.deinit();
     try std.testing.expectEqualStrings("fedcba9876543210fedcba9876543210", continued_from_headers.trace_id[0..]);
+
+    var continued_from_span = startTransactionFromSpan(
+        .{ .name = "GET /continued-global-span", .op = "http.server" },
+        .{ .transaction = &txn },
+    ).?;
+    defer continued_from_span.deinit();
+    try std.testing.expectEqualStrings(txn.trace_id[0..], continued_from_span.trace_id[0..]);
 
     var baggage_only = startTransactionFromPropagationHeaders(
         .{ .name = "GET /baggage-global", .op = "http.server" },

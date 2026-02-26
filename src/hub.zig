@@ -10,6 +10,7 @@ const IntegrationSetupFn = client_mod.IntegrationSetupFn;
 const IntegrationLookupCallback = client_mod.IntegrationLookupCallback;
 const Transaction = @import("transaction.zig").Transaction;
 const TransactionOpts = @import("transaction.zig").TransactionOpts;
+const TransactionOrSpan = @import("transaction.zig").TransactionOrSpan;
 const PropagationHeader = @import("propagation.zig").PropagationHeader;
 const Event = @import("event.zig").Event;
 const Level = @import("event.zig").Level;
@@ -309,6 +310,14 @@ pub const Hub = struct {
         return self.client.startTransactionFromHeaders(opts, headers);
     }
 
+    pub fn startTransactionFromSpan(
+        self: *Hub,
+        opts: TransactionOpts,
+        source: ?TransactionOrSpan,
+    ) Transaction {
+        return self.client.startTransactionFromSpan(opts, source);
+    }
+
     pub fn finishTransaction(self: *Hub, txn: *Transaction) void {
         self.client.finishTransaction(txn);
     }
@@ -599,6 +608,34 @@ test "Hub startTransactionFromHeaders continues upstream trace" {
     try testing.expectEqualStrings("0123456789abcdef0123456789abcdef", txn.trace_id[0..]);
     try testing.expect(txn.parent_span_id != null);
     try testing.expectEqualStrings("89abcdef01234567", txn.parent_span_id.?[0..]);
+}
+
+test "Hub startTransactionFromSpan continues from transaction context" {
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var hub = try Hub.init(testing.allocator, client);
+    defer hub.deinit();
+
+    var parent = hub.startTransaction(.{
+        .name = "GET /parent",
+        .op = "http.server",
+    });
+    defer parent.deinit();
+
+    var child = hub.startTransactionFromSpan(.{
+        .name = "GET /continued",
+        .op = "http.server",
+    }, .{ .transaction = &parent });
+    defer child.deinit();
+
+    try testing.expectEqualStrings(parent.trace_id[0..], child.trace_id[0..]);
+    try testing.expect(child.parent_span_id != null);
+    try testing.expectEqualStrings(parent.span_id[0..], child.parent_span_id.?[0..]);
 }
 
 test "Hub startTransactionWithTimestamp applies explicit start timestamp" {

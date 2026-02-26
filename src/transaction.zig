@@ -74,6 +74,11 @@ pub const ChildSpanOpts = struct {
     description: ?[]const u8 = null,
 };
 
+pub const TransactionOrSpan = union(enum) {
+    transaction: *const Transaction,
+    span: *const Span,
+};
+
 /// Options for creating a transaction.
 pub const TransactionOpts = struct {
     name: []const u8,
