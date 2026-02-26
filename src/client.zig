@@ -1697,6 +1697,9 @@ var before_send_first_frame_in_app: ?bool = null;
 var before_send_observed_server_name: ?[]const u8 = null;
 var before_send_observed_dist: ?[]const u8 = null;
 var before_send_breadcrumbs_match: bool = false;
+var combined_sequence_event_count: usize = 0;
+var combined_sequence_first_ok: bool = false;
+var combined_sequence_second_ok: bool = false;
 
 fn inspectTraceContextBeforeSend(event: *Event) ?*Event {
     before_send_saw_trace_context = hasTraceContext(event);
@@ -1752,6 +1755,40 @@ fn inspectBreadcrumbOrderBeforeSend(event: *Event) ?*Event {
     }
 
     before_send_breadcrumbs_match = true;
+    return event;
+}
+
+fn inspectCombinedEventSequenceBeforeSend(event: *Event) ?*Event {
+    const idx = combined_sequence_event_count;
+    combined_sequence_event_count += 1;
+
+    if (idx == 0) {
+        if (event.message) |message| {
+            if (message.formatted) |formatted| {
+                combined_sequence_first_ok = std.mem.eql(u8, formatted, "Both a breadcrumb and an event");
+            }
+        }
+        return event;
+    }
+
+    if (idx == 1) {
+        var second_ok = false;
+        if (event.message) |message| {
+            if (message.formatted) |formatted| {
+                if (std.mem.eql(u8, formatted, "An event")) {
+                    if (event.breadcrumbs) |breadcrumbs| {
+                        if (breadcrumbs.len == 1) {
+                            if (breadcrumbs[0].message) |crumb_message| {
+                                second_ok = std.mem.eql(u8, crumb_message, "Both a breadcrumb and an event");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        combined_sequence_second_ok = second_ok;
+    }
+
     return event;
 }
 
@@ -1852,6 +1889,30 @@ test "Client breadcrumbs preserve order after clearing older entries" {
 
     try testing.expect(client.captureMessageId("breadcrumb-order", .warning) != null);
     try testing.expect(before_send_breadcrumbs_match);
+}
+
+test "Client combined breadcrumb and event sequencing matches tracing filter behavior" {
+    combined_sequence_event_count = 0;
+    combined_sequence_first_ok = false;
+    combined_sequence_second_ok = false;
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .before_send = inspectCombinedEventSequenceBeforeSend,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    client.addBreadcrumb(.{
+        .level = .err,
+        .message = "Both a breadcrumb and an event",
+    });
+    try testing.expect(client.captureMessageId("Both a breadcrumb and an event", .err) != null);
+    try testing.expect(client.captureMessageId("An event", .warning) != null);
+
+    try testing.expectEqual(@as(usize, 2), combined_sequence_event_count);
+    try testing.expect(combined_sequence_first_ok);
+    try testing.expect(combined_sequence_second_ok);
 }
 
 test "Client captureMessage injects default trace context into event" {
