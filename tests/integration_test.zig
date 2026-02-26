@@ -791,6 +791,44 @@ test "CJM e2e: client scope enriches transaction metadata" {
     try testing.expect(relay.containsInAny("\"scope-context\":8"));
 }
 
+test "CJM e2e: scope transaction override renames transaction and preserves request" {
+    var relay = try CaptureRelay.init(testing.allocator, &.{});
+    defer relay.deinit();
+    try relay.start();
+
+    const local_dsn = try makeLocalDsn(testing.allocator, relay.port());
+    defer testing.allocator.free(local_dsn);
+
+    const client = try sentry.init(testing.allocator, .{
+        .dsn = local_dsn,
+        .traces_sample_rate = 1.0,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    try client.trySetTransaction("new name");
+
+    var txn = client.startTransaction(.{
+        .name = "old name",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+
+    try txn.setRequest(.{
+        .method = "GET",
+        .url = "https://honk.beep",
+    });
+
+    client.finishTransaction(&txn);
+    try testing.expect(client.flush(2000));
+    try testing.expect(relay.waitForAtLeast(1, 2000));
+
+    try testing.expect(relay.containsInAny("\"type\":\"transaction\""));
+    try testing.expect(relay.containsInAny("\"transaction\":\"new name\""));
+    try testing.expect(relay.containsInAny("\"request\":{"));
+    try testing.expect(relay.containsInAny("\"url\":\"https://honk.beep\""));
+}
+
 test "CJM e2e: global transaction API uses current hub scope metadata" {
     var relay = try CaptureRelay.init(testing.allocator, &.{});
     defer relay.deinit();

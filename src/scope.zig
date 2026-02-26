@@ -742,11 +742,15 @@ pub const Scope = struct {
         return out;
     }
 
-    /// Apply scope tags/extra/contexts to a transaction-like object.
-    /// The transaction must provide `setTag`, `setExtra`, and `setContext`.
+    /// Apply scope transaction metadata to a transaction-like object.
+    /// The transaction must provide `setName`, `setTag`, `setExtra`, and `setContext`.
     pub fn applyToTransaction(self: *Scope, transaction: anytype) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
+
+        if (self.transaction) |name| {
+            transaction.setName(name);
+        }
 
         var tag_it = self.tags.iterator();
         while (tag_it.next()) |entry| {
@@ -1194,6 +1198,7 @@ test "Scope applyToEvent sets transaction and fingerprint and restores on cleanu
 
 const ScopeTransactionProbe = struct {
     allocator: Allocator,
+    name: ?[]u8 = null,
     tags: std.StringHashMap([]const u8),
     extra: std.StringHashMap(json.Value),
     contexts: std.StringHashMap(json.Value),
@@ -1208,6 +1213,8 @@ const ScopeTransactionProbe = struct {
     }
 
     fn deinit(self: *ScopeTransactionProbe) void {
+        if (self.name) |name| self.allocator.free(name);
+
         var tag_it = self.tags.iterator();
         while (tag_it.next()) |entry| {
             self.allocator.free(@constCast(entry.key_ptr.*));
@@ -1228,6 +1235,12 @@ const ScopeTransactionProbe = struct {
             deinitJsonValueDeep(self.allocator, entry.value_ptr);
         }
         self.contexts.deinit();
+    }
+
+    fn setName(self: *ScopeTransactionProbe, name: []const u8) void {
+        const copy = self.allocator.dupe(u8, name) catch return;
+        if (self.name) |old| self.allocator.free(old);
+        self.name = copy;
     }
 
     fn setTag(self: *ScopeTransactionProbe, key: []const u8, value: []const u8) !void {
@@ -1276,6 +1289,8 @@ const ScopeTransactionProbe = struct {
 };
 
 const FailingTransactionSink = struct {
+    fn setName(_: *FailingTransactionSink, _: []const u8) void {}
+
     fn setTag(_: *FailingTransactionSink, _: []const u8, _: []const u8) !void {
         return error.OutOfMemory;
     }
@@ -1307,6 +1322,21 @@ test "Scope applyToTransaction copies tags extra and contexts" {
     const context = probe.contexts.get("app").?;
     try testing.expect(context == .integer);
     try testing.expectEqual(@as(i64, 42), context.integer);
+}
+
+test "Scope applyToTransaction applies transaction name override" {
+    var scope = try Scope.init(testing.allocator, 10);
+    defer scope.deinit();
+
+    try scope.setTransaction("renamed-transaction");
+
+    var probe = ScopeTransactionProbe.init(testing.allocator);
+    defer probe.deinit();
+
+    try scope.applyToTransaction(&probe);
+
+    try testing.expect(probe.name != null);
+    try testing.expectEqualStrings("renamed-transaction", probe.name.?);
 }
 
 test "Scope applyToTransaction propagates transaction sink errors" {

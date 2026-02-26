@@ -2276,6 +2276,44 @@ test "Client finishTransaction applies scope tags extra and contexts" {
     try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"scope-context\":9") != null);
 }
 
+test "Client finishTransaction applies scope transaction name override and keeps request" {
+    var state = PayloadTransportState.init(testing.allocator);
+    defer state.deinit();
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .transport = .{
+            .send_fn = payloadTransportSendFn,
+            .ctx = &state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    try client.trySetTransaction("new name");
+
+    var txn = client.startTransaction(.{
+        .name = "old name",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+
+    try txn.setRequest(.{
+        .method = "GET",
+        .url = "https://honk.beep",
+    });
+
+    client.finishTransaction(&txn);
+    _ = client.flush(1000);
+
+    try testing.expectEqual(@as(usize, 1), state.sent_count);
+    try testing.expect(state.last_payload != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"transaction\":\"new name\"") != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"request\":{") != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"url\":\"https://honk.beep\"") != null);
+}
+
 test "Client serializeLogEnvelope writes log item type" {
     const client = try Client.init(testing.allocator, .{
         .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
