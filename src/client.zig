@@ -305,7 +305,7 @@ pub const Client = struct {
         };
 
         if (prepared_event.contexts == null) {
-            const contexts = buildDefaultTraceContexts(self.allocator) catch null;
+            const contexts = buildDefaultTraceContexts(self.allocator, self.options.default_integrations) catch null;
             if (contexts) |value| {
                 prepared_event.contexts = value;
                 owned_trace_contexts = value;
@@ -746,7 +746,7 @@ pub const Client = struct {
         try putOwnedJsonEntry(allocator, object, key, .{ .bool = value });
     }
 
-    fn buildDefaultTraceContexts(allocator: Allocator) !json.Value {
+    fn buildDefaultTraceContexts(allocator: Allocator, include_runtime_os: bool) !json.Value {
         const trace_id = Uuid.v4().toHex();
         const span_id = txn_mod.generateSpanId();
         var runtime_version_buf: [64]u8 = undefined;
@@ -772,23 +772,31 @@ pub const Client = struct {
         try putOwnedString(allocator, &trace_object, "span_id", &span_id);
         try putOwnedBool(allocator, &trace_object, "sampled", false);
 
-        var runtime_object = json.ObjectMap.init(allocator);
-        var runtime_moved = false;
-        errdefer if (!runtime_moved) {
-            var value: json.Value = .{ .object = runtime_object };
-            scope_mod.deinitJsonValueDeep(allocator, &value);
-        };
-        try putOwnedString(allocator, &runtime_object, "name", "zig");
-        try putOwnedString(allocator, &runtime_object, "version", runtime_version);
+        var runtime_object: json.ObjectMap = undefined;
+        var runtime_moved = true;
+        if (include_runtime_os) {
+            runtime_object = json.ObjectMap.init(allocator);
+            runtime_moved = false;
+            errdefer if (!runtime_moved) {
+                var value: json.Value = .{ .object = runtime_object };
+                scope_mod.deinitJsonValueDeep(allocator, &value);
+            };
+            try putOwnedString(allocator, &runtime_object, "name", "zig");
+            try putOwnedString(allocator, &runtime_object, "version", runtime_version);
+        }
 
-        var os_object = json.ObjectMap.init(allocator);
-        var os_moved = false;
-        errdefer if (!os_moved) {
-            var value: json.Value = .{ .object = os_object };
-            scope_mod.deinitJsonValueDeep(allocator, &value);
-        };
-        try putOwnedString(allocator, &os_object, "name", @tagName(builtin.os.tag));
-        try putOwnedString(allocator, &os_object, "arch", @tagName(builtin.cpu.arch));
+        var os_object: json.ObjectMap = undefined;
+        var os_moved = true;
+        if (include_runtime_os) {
+            os_object = json.ObjectMap.init(allocator);
+            os_moved = false;
+            errdefer if (!os_moved) {
+                var value: json.Value = .{ .object = os_object };
+                scope_mod.deinitJsonValueDeep(allocator, &value);
+            };
+            try putOwnedString(allocator, &os_object, "name", @tagName(builtin.os.tag));
+            try putOwnedString(allocator, &os_object, "arch", @tagName(builtin.cpu.arch));
+        }
 
         var contexts_object = json.ObjectMap.init(allocator);
         errdefer {
@@ -798,10 +806,12 @@ pub const Client = struct {
 
         try putOwnedJsonEntry(allocator, &contexts_object, "trace", .{ .object = trace_object });
         trace_moved = true;
-        try putOwnedJsonEntry(allocator, &contexts_object, "runtime", .{ .object = runtime_object });
-        runtime_moved = true;
-        try putOwnedJsonEntry(allocator, &contexts_object, "os", .{ .object = os_object });
-        os_moved = true;
+        if (include_runtime_os) {
+            try putOwnedJsonEntry(allocator, &contexts_object, "runtime", .{ .object = runtime_object });
+            runtime_moved = true;
+            try putOwnedJsonEntry(allocator, &contexts_object, "os", .{ .object = os_object });
+            os_moved = true;
+        }
         return .{ .object = contexts_object };
     }
 
@@ -1205,6 +1215,25 @@ test "Client captureMessage injects default trace context into event" {
     try testing.expect(before_send_saw_trace_context);
     try testing.expect(before_send_saw_runtime_context);
     try testing.expect(before_send_saw_os_context);
+}
+
+test "Client default_integrations false injects trace context without runtime or os" {
+    before_send_saw_trace_context = false;
+    before_send_saw_runtime_context = false;
+    before_send_saw_os_context = false;
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .default_integrations = false,
+        .before_send = inspectTraceContextBeforeSend,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    try testing.expect(client.captureMessageId("trace-only-context-message", .info) != null);
+    try testing.expect(before_send_saw_trace_context);
+    try testing.expect(!before_send_saw_runtime_context);
+    try testing.expect(!before_send_saw_os_context);
 }
 
 test "Client attach_stacktrace adds synthetic thread stacktrace data" {

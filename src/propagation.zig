@@ -29,6 +29,25 @@ pub const ParsedBaggage = struct {
     sampled: ?bool = null,
 };
 
+pub const ParsedBaggageOwned = struct {
+    allocator: Allocator,
+    trace_id: ?[32]u8 = null,
+    public_key: ?[]u8 = null,
+    release: ?[]u8 = null,
+    environment: ?[]u8 = null,
+    transaction: ?[]u8 = null,
+    sample_rate: ?f64 = null,
+    sampled: ?bool = null,
+
+    pub fn deinit(self: *ParsedBaggageOwned) void {
+        if (self.public_key) |value| self.allocator.free(value);
+        if (self.release) |value| self.allocator.free(value);
+        if (self.environment) |value| self.allocator.free(value);
+        if (self.transaction) |value| self.allocator.free(value);
+        self.* = undefined;
+    }
+};
+
 pub fn parseSentryTrace(header_value: []const u8) ?SentryTrace {
     const trimmed = std.mem.trim(u8, header_value, " \t");
     if (trimmed.len == 0) return null;
@@ -146,6 +165,24 @@ pub fn parseBaggage(header_value: []const u8) ParsedBaggage {
     return parsed;
 }
 
+pub fn parseBaggageAlloc(allocator: Allocator, header_value: []const u8) !ParsedBaggageOwned {
+    const parsed = parseBaggage(header_value);
+    var owned: ParsedBaggageOwned = .{
+        .allocator = allocator,
+        .trace_id = parsed.trace_id,
+        .sample_rate = parsed.sample_rate,
+        .sampled = parsed.sampled,
+    };
+    errdefer owned.deinit();
+
+    if (parsed.public_key) |value| owned.public_key = try decodePercentValueAlloc(allocator, value);
+    if (parsed.release) |value| owned.release = try decodePercentValueAlloc(allocator, value);
+    if (parsed.environment) |value| owned.environment = try decodePercentValueAlloc(allocator, value);
+    if (parsed.transaction) |value| owned.transaction = try decodePercentValueAlloc(allocator, value);
+
+    return owned;
+}
+
 fn parseSampled(sampled_text: []const u8) ?bool {
     if (std.mem.eql(u8, sampled_text, "1")) return true;
     if (std.mem.eql(u8, sampled_text, "0")) return false;
@@ -156,6 +193,15 @@ fn parseSampledBool(sampled_text: []const u8) ?bool {
     if (std.mem.eql(u8, sampled_text, "1") or std.mem.eql(u8, sampled_text, "true")) return true;
     if (std.mem.eql(u8, sampled_text, "0") or std.mem.eql(u8, sampled_text, "false")) return false;
     return null;
+}
+
+fn decodePercentValueAlloc(allocator: Allocator, value: []const u8) ![]u8 {
+    const temp = try allocator.dupe(u8, value);
+    defer allocator.free(temp);
+    const decoded = std.Uri.percentDecodeInPlace(temp);
+    const copy = try allocator.alloc(u8, decoded.len);
+    @memcpy(copy, decoded);
+    return copy;
 }
 
 fn isHex(value: []const u8, expected_len: usize) bool {
@@ -254,4 +300,17 @@ test "parseBaggage extracts sentry keys" {
     try testing.expectEqualStrings("pub", parsed.public_key.?);
     try testing.expectEqual(@as(?f64, 0.75), parsed.sample_rate);
     try testing.expectEqual(@as(?bool, false), parsed.sampled);
+}
+
+test "parseBaggageAlloc decodes percent-encoded values" {
+    var parsed = try parseBaggageAlloc(
+        testing.allocator,
+        "sentry-public_key=pub%2Dkey,sentry-release=app%401.2.3,sentry-environment=prod,sentry-transaction=POST%20/checkout",
+    );
+    defer parsed.deinit();
+
+    try testing.expectEqualStrings("pub-key", parsed.public_key.?);
+    try testing.expectEqualStrings("app@1.2.3", parsed.release.?);
+    try testing.expectEqualStrings("prod", parsed.environment.?);
+    try testing.expectEqualStrings("POST /checkout", parsed.transaction.?);
 }

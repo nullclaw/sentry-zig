@@ -266,6 +266,8 @@ const client = try sentry.init(allocator, .{
 For regular event messages, the SDK automatically adds default contexts
 (`contexts.trace`, `contexts.runtime`, `contexts.os`) when trace context
 is missing in the input event.
+
+Set `default_integrations=false` to disable automatic `runtime`/`os` context enrichment.
 For transaction envelopes, the SDK adds a dynamic trace header
 (`trace_id/public_key/sample_rate/sampled`).
 
@@ -303,6 +305,14 @@ defer allocator.free(sentry_trace);
 
 const baggage = try client.baggageHeader(&txn, allocator);
 defer allocator.free(baggage);
+```
+
+You can parse incoming baggage directly:
+
+```zig
+const parsed_baggage = sentry.parseBaggage(incoming_baggage_header); // borrowed fields
+var parsed_baggage_owned = try sentry.parseBaggageAlloc(allocator, incoming_baggage_header); // decoded owned fields
+defer parsed_baggage_owned.deinit();
 ```
 
 ### attach_stacktrace

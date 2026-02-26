@@ -50,8 +50,10 @@ pub const envelope = @import("envelope.zig");
 pub const SentryTrace = @import("propagation.zig").SentryTrace;
 pub const DynamicSamplingContext = @import("propagation.zig").DynamicSamplingContext;
 pub const ParsedBaggage = @import("propagation.zig").ParsedBaggage;
+pub const ParsedBaggageOwned = @import("propagation.zig").ParsedBaggageOwned;
 pub const parseSentryTrace = @import("propagation.zig").parseSentryTrace;
 pub const parseBaggage = @import("propagation.zig").parseBaggage;
+pub const parseBaggageAlloc = @import("propagation.zig").parseBaggageAlloc;
 pub const formatSentryTraceAlloc = @import("propagation.zig").formatSentryTraceAlloc;
 pub const formatBaggageAlloc = @import("propagation.zig").formatBaggageAlloc;
 pub const Uuid = @import("uuid.zig").Uuid;
@@ -77,6 +79,41 @@ pub fn currentHub() ?*Hub {
 
 pub fn clearCurrentHub() ?*Hub {
     return Hub.clearCurrent();
+}
+
+pub fn startTransaction(opts: TransactionOpts) ?Transaction {
+    const hub = Hub.current() orelse return null;
+    return hub.startTransaction(opts);
+}
+
+pub fn startTransactionFromSentryTrace(opts: TransactionOpts, sentry_trace_header: []const u8) ?Transaction {
+    const hub = Hub.current() orelse return null;
+    return hub.startTransactionFromSentryTrace(opts, sentry_trace_header) catch null;
+}
+
+pub fn startTransactionFromPropagationHeaders(
+    opts: TransactionOpts,
+    sentry_trace_header: ?[]const u8,
+    baggage_header: ?[]const u8,
+) ?Transaction {
+    const hub = Hub.current() orelse return null;
+    return hub.startTransactionFromPropagationHeaders(opts, sentry_trace_header, baggage_header) catch null;
+}
+
+pub fn finishTransaction(txn: *Transaction) bool {
+    const hub = Hub.current() orelse return false;
+    hub.finishTransaction(txn);
+    return true;
+}
+
+pub fn sentryTraceHeader(txn: *const Transaction, allocator: std.mem.Allocator) ?[]u8 {
+    const hub = Hub.current() orelse return null;
+    return hub.sentryTraceHeader(txn, allocator) catch null;
+}
+
+pub fn baggageHeader(txn: *const Transaction, allocator: std.mem.Allocator) ?[]u8 {
+    const hub = Hub.current() orelse return null;
+    return hub.baggageHeader(txn, allocator) catch null;
 }
 
 pub fn captureEvent(event: *Event) ?[32]u8 {
@@ -159,6 +196,16 @@ test "global wrappers are safe no-op without current hub" {
     try std.testing.expect(captureMessage("no-hub", .info) == null);
     try std.testing.expect(captureException("TypeError", "no-hub") == null);
     try std.testing.expect(!captureLogMessage("no-hub", .info));
+    try std.testing.expect(startTransaction(.{ .name = "no-hub" }) == null);
+    try std.testing.expect(startTransactionFromSentryTrace(
+        .{ .name = "no-hub" },
+        "0123456789abcdef0123456789abcdef-89abcdef01234567-1",
+    ) == null);
+    try std.testing.expect(startTransactionFromPropagationHeaders(
+        .{ .name = "no-hub" },
+        null,
+        "sentry-trace_id=fedcba9876543210fedcba9876543210,sentry-sampled=false",
+    ) == null);
     try std.testing.expect(!pushScope());
     try std.testing.expect(!popScope());
     try std.testing.expect(!configureScope(configureScopeSetInner));
@@ -201,6 +248,31 @@ test "global wrappers route through current hub" {
     try std.testing.expectEqualSlices(u8, &event_id.?, &client.lastEventId().?);
 
     try std.testing.expect(captureLogMessage("global-log", .warn));
+
+    var txn = startTransaction(.{ .name = "GET /global", .op = "http.server" }).?;
+    defer txn.deinit();
+    const tx_trace_header = sentryTraceHeader(&txn, std.testing.allocator).?;
+    defer std.testing.allocator.free(tx_trace_header);
+    const tx_baggage = baggageHeader(&txn, std.testing.allocator).?;
+    defer std.testing.allocator.free(tx_baggage);
+    try std.testing.expect(std.mem.indexOf(u8, tx_trace_header, txn.trace_id[0..]) != null);
+    try std.testing.expect(std.mem.indexOf(u8, tx_baggage, "sentry-trace_id=") != null);
+    try std.testing.expect(finishTransaction(&txn));
+
+    var continued = startTransactionFromSentryTrace(
+        .{ .name = "GET /continued-global", .op = "http.server" },
+        "0123456789abcdef0123456789abcdef-89abcdef01234567-1",
+    ).?;
+    defer continued.deinit();
+    try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", continued.trace_id[0..]);
+
+    var baggage_only = startTransactionFromPropagationHeaders(
+        .{ .name = "GET /baggage-global", .op = "http.server" },
+        null,
+        "sentry-trace_id=fedcba9876543210fedcba9876543210,sentry-sampled=false",
+    ).?;
+    defer baggage_only.deinit();
+    try std.testing.expectEqualStrings("fedcba9876543210fedcba9876543210", baggage_only.trace_id[0..]);
 }
 
 test {

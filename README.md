@@ -149,6 +149,11 @@ var txn2 = try client.startTransactionFromPropagationHeaders(
     incoming_baggage,
 );
 defer txn2.deinit();
+
+// Parse incoming baggage directly (borrowed or decoded/owned variants)
+const parsed_baggage = sentry.parseBaggage(incoming_baggage);
+var parsed_baggage_owned = try sentry.parseBaggageAlloc(allocator, incoming_baggage);
+defer parsed_baggage_owned.deinit();
 ```
 
 ```zig
@@ -198,6 +203,9 @@ All options are provided via `sentry.Options` in `sentry.init`.
 | `accept_invalid_certs` | `bool` | `false` | Transport TLS policy toggle reserved for advanced setups |
 | `max_request_body_size` | `?usize` | `null` | Drop envelopes larger than this byte size |
 | `enable_logs` | `bool` | `true` | Enable/disable structured log submissions |
+
+When `default_integrations = false`, automatic runtime/os context enrichment is disabled
+(trace context bootstrap remains enabled).
 | `cache_dir` | `[]const u8` | `"/tmp/sentry-zig"` | Crash marker directory |
 | `user_agent` | `[]const u8` | `"sentry-zig/0.1.0"` | Transport User-Agent |
 | `install_signal_handlers` | `bool` | `true` | POSIX signal handler install |

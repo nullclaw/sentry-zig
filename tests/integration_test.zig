@@ -832,6 +832,31 @@ test "CJM e2e: max_request_body_size drops oversized events" {
     try testing.expectEqual(@as(usize, 0), relay.requestCount());
 }
 
+test "CJM e2e: default_integrations false omits runtime and os contexts" {
+    var relay = try CaptureRelay.init(testing.allocator, &.{});
+    defer relay.deinit();
+    try relay.start();
+
+    const local_dsn = try makeLocalDsn(testing.allocator, relay.port());
+    defer testing.allocator.free(local_dsn);
+
+    const client = try sentry.init(testing.allocator, .{
+        .dsn = local_dsn,
+        .default_integrations = false,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    client.captureMessage("trace-only-bootstrap", .info);
+    try testing.expect(client.flush(2000));
+    try testing.expect(relay.waitForAtLeast(1, 2000));
+
+    try testing.expect(relay.containsInAny("\"type\":\"event\""));
+    try testing.expect(relay.containsInAny("\"trace_id\""));
+    try testing.expect(!relay.containsInAny("\"runtime\":"));
+    try testing.expect(!relay.containsInAny("\"os\":"));
+}
+
 // ─── 9. Timestamp Formatting ────────────────────────────────────────────────
 
 test "Timestamp: now() is reasonable" {
