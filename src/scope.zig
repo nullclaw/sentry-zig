@@ -793,6 +793,17 @@ pub const Scope = struct {
         return out;
     }
 
+    /// Snapshot current user into an owned copy for capture-time enrichment.
+    pub fn snapshotUser(self: *Scope, allocator: Allocator) !?User {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.user) |user| {
+            return try cloneUser(allocator, user);
+        }
+        return null;
+    }
+
     /// Apply scope transaction metadata to a transaction-like object.
     /// The transaction must provide `setName`, `setUser`, `setTag`, `setExtra`, and `setContext`.
     pub fn applyToTransaction(self: *Scope, transaction: anytype) !void {
@@ -1640,6 +1651,22 @@ test "Scope snapshotAttachments returns owned copies" {
     try testing.expectEqualStrings("payload.txt", snapshot[0].filename);
     try testing.expectEqualStrings("hello", snapshot[0].data);
     try testing.expectEqualStrings("text/plain", snapshot[0].content_type.?);
+}
+
+test "Scope snapshotUser returns owned copy" {
+    var scope = try Scope.init(testing.allocator, 10);
+    defer scope.deinit();
+
+    scope.setUser(.{
+        .id = "user-42",
+        .email = "buyer@example.com",
+    });
+
+    var user = (try scope.snapshotUser(testing.allocator)).?;
+    defer deinitUserDeep(testing.allocator, &user);
+
+    try testing.expectEqualStrings("user-42", user.id.?);
+    try testing.expectEqualStrings("buyer@example.com", user.email.?);
 }
 
 fn dropProcessor(_: *Event) bool {

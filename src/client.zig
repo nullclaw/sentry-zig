@@ -280,6 +280,20 @@ pub const Client = struct {
             prepared.trace_id = source_scope.getPropagationContext().trace_id;
         }
 
+        var owned_log_attributes: ?json.Value = null;
+        defer if (owned_log_attributes) |*attributes| {
+            scope_mod.deinitJsonValueDeep(self.allocator, attributes);
+            prepared.attributes = null;
+        };
+        owned_log_attributes = buildEnrichedLogAttributes(
+            self.allocator,
+            prepared.attributes,
+            source_scope,
+        ) catch null;
+        if (owned_log_attributes) |attributes| {
+            prepared.attributes = attributes;
+        }
+
         if (self.options.before_send_log) |before_send_log| {
             if (before_send_log(&prepared)) |processed| {
                 // For memory safety, callbacks must mutate in place and return
@@ -1062,6 +1076,70 @@ pub const Client = struct {
         value: bool,
     ) !void {
         try putOwnedJsonEntry(allocator, object, key, .{ .bool = value });
+    }
+
+    fn putOwnedStringIfMissing(
+        allocator: Allocator,
+        object: *json.ObjectMap,
+        key: []const u8,
+        value: []const u8,
+    ) !void {
+        if (object.get(key) != null) return;
+        try putOwnedString(allocator, object, key, value);
+    }
+
+    fn buildEnrichedLogAttributes(
+        allocator: Allocator,
+        existing: ?json.Value,
+        source_scope: *Scope,
+    ) !json.Value {
+        var attributes_object = json.ObjectMap.init(allocator);
+        errdefer {
+            var value: json.Value = .{ .object = attributes_object };
+            scope_mod.deinitJsonValueDeep(allocator, &value);
+        }
+
+        if (existing) |value| {
+            if (value == .object) {
+                var it = value.object.iterator();
+                while (it.next()) |entry| {
+                    const key_copy = try allocator.dupe(u8, entry.key_ptr.*);
+                    errdefer allocator.free(key_copy);
+                    var value_copy = try scope_mod.cloneJsonValue(allocator, entry.value_ptr.*);
+                    errdefer scope_mod.deinitJsonValueDeep(allocator, &value_copy);
+                    try attributes_object.put(key_copy, value_copy);
+                }
+            }
+        }
+
+        try putOwnedStringIfMissing(allocator, &attributes_object, "sentry.sdk.name", envelope.SDK_NAME);
+        try putOwnedStringIfMissing(allocator, &attributes_object, "sentry.sdk.version", envelope.SDK_VERSION);
+
+        const propagation_context = source_scope.getPropagationContext();
+        try putOwnedStringIfMissing(
+            allocator,
+            &attributes_object,
+            "parent_span_id",
+            propagation_context.span_id[0..],
+        );
+
+        if (try source_scope.snapshotUser(allocator)) |user| {
+            defer {
+                var owned = user;
+                scope_mod.deinitUserDeep(allocator, &owned);
+            }
+            if (user.id) |id| {
+                try putOwnedStringIfMissing(allocator, &attributes_object, "user.id", id);
+            }
+            if (user.username) |name| {
+                try putOwnedStringIfMissing(allocator, &attributes_object, "user.name", name);
+            }
+            if (user.email) |email| {
+                try putOwnedStringIfMissing(allocator, &attributes_object, "user.email", email);
+            }
+        }
+
+        return .{ .object = attributes_object };
     }
 
     fn buildDefaultTraceContexts(
@@ -2537,6 +2615,49 @@ test "Client serializeLogEnvelope writes log item type" {
 
     try testing.expect(std.mem.indexOf(u8, serialized, "\"type\":\"log\"") != null);
     try testing.expect(std.mem.indexOf(u8, serialized, "\"body\":\"log-entry\"") != null);
+}
+
+test "Client captureLogMessage enriches sdk and scope log attributes" {
+    var state = PayloadTransportState.init(testing.allocator);
+    defer state.deinit();
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .transport = .{
+            .send_fn = payloadTransportSendFn,
+            .ctx = &state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    client.setUser(.{
+        .id = "user-42",
+        .email = "buyer@example.com",
+        .username = "buyer",
+    });
+
+    var txn = client.startTransaction(.{
+        .name = "GET /log-attrs",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+    client.setSpan(.{ .transaction = &txn });
+
+    client.captureLogMessage("enriched-log", .warn);
+    _ = client.flush(1000);
+
+    const expected_parent_span = try std.fmt.allocPrint(testing.allocator, "\"parent_span_id\":\"{s}\"", .{txn.span_id[0..]});
+    defer testing.allocator.free(expected_parent_span);
+
+    try testing.expectEqual(@as(usize, 1), state.sent_count);
+    try testing.expect(state.last_payload != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"sentry.sdk.name\":\"sentry-zig\"") != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"sentry.sdk.version\":\"0.1.0\"") != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, expected_parent_span) != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"user.id\":\"user-42\"") != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"user.name\":\"buyer\"") != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"user.email\":\"buyer@example.com\"") != null);
 }
 
 test "Client before_send_log drops replacement pointers for memory safety" {
