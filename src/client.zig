@@ -633,6 +633,13 @@ pub const Client = struct {
             if (real_opts.parent_sampled == null and parsed_baggage.sampled != null) {
                 real_opts.parent_sampled = parsed_baggage.sampled;
             }
+            if (real_opts.sample_rate == 1.0) {
+                if (parsed_baggage.sample_rate) |sample_rate| {
+                    if (isValidSampleRate(sample_rate)) {
+                        real_opts.sample_rate = sample_rate;
+                    }
+                }
+            }
         }
 
         return self.startTransaction(real_opts);
@@ -1759,6 +1766,25 @@ test "Client startTransactionFromPropagationHeaders reads baggage sampled fallba
 
     try testing.expectEqualStrings("fedcba9876543210fedcba9876543210", txn.trace_id[0..]);
     try testing.expectEqual(@as(?bool, false), txn.parent_sampled);
+    try testing.expectEqual(@as(f64, 0.0), txn.sample_rate);
+    try testing.expect(!txn.sampled);
+}
+
+test "Client startTransactionFromPropagationHeaders applies baggage sample_rate" {
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var txn = try client.startTransactionFromPropagationHeaders(
+        .{ .name = "GET /baggage-sample-rate" },
+        null,
+        "sentry-trace_id=fedcba9876543210fedcba9876543210,sentry-sample_rate=0.000000",
+    );
+    defer txn.deinit();
+
+    try testing.expectEqualStrings("fedcba9876543210fedcba9876543210", txn.trace_id[0..]);
     try testing.expectEqual(@as(f64, 0.0), txn.sample_rate);
     try testing.expect(!txn.sampled);
 }

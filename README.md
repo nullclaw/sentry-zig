@@ -149,6 +149,7 @@ var txn2 = try client.startTransactionFromPropagationHeaders(
     incoming_baggage,
 );
 defer txn2.deinit();
+// `sentry-sample_rate` from baggage is honored when transaction opts use default sample_rate.
 
 // Parse incoming baggage directly (borrowed or decoded/owned variants)
 const parsed_baggage = sentry.parseBaggage(incoming_baggage);
@@ -207,6 +208,14 @@ All options are provided via `sentry.Options` in `sentry.init`.
 When `default_integrations = false`, automatic runtime/os context enrichment is disabled
 (trace context bootstrap remains enabled).
 `in_app_include`/`in_app_exclude` are applied to exception stack frames.
+
+Example integration setup callback:
+
+```zig
+fn setupCheckoutIntegration(client: *sentry.Client, _: ?*anyopaque) void {
+    client.setTag("integration", "checkout");
+}
+```
 | `cache_dir` | `[]const u8` | `"/tmp/sentry-zig"` | Crash marker directory |
 | `user_agent` | `[]const u8` | `"sentry-zig/0.1.0"` | Transport User-Agent |
 | `install_signal_handlers` | `bool` | `true` | POSIX signal handler install |

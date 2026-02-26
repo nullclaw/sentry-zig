@@ -11,6 +11,15 @@ fn dropEventProcessor(_: *sentry.Event) bool {
     return false;
 }
 
+fn applyCheckoutIntegration(client: *sentry.Client, _: ?*anyopaque) void {
+    client.setTag("integration", "checkout");
+    client.addBreadcrumb(.{
+        .category = "integration",
+        .message = "checkout integration setup",
+        .level = .info,
+    });
+}
+
 const CaptureRelay = struct {
     allocator: std.mem.Allocator,
     server: std.net.Server,
@@ -811,6 +820,36 @@ test "CJM e2e: continued transaction keeps upstream trace identifiers" {
     try testing.expect(relay.containsInAny("\"parent_span_id\":\"89abcdef01234567\""));
 }
 
+test "CJM e2e: baggage sample_rate 0 drops unsampled continued transaction" {
+    var relay = try CaptureRelay.init(testing.allocator, &.{});
+    defer relay.deinit();
+    try relay.start();
+
+    const local_dsn = try makeLocalDsn(testing.allocator, relay.port());
+    defer testing.allocator.free(local_dsn);
+
+    const client = try sentry.init(testing.allocator, .{
+        .dsn = local_dsn,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var txn = try client.startTransactionFromPropagationHeaders(
+        .{
+            .name = "GET /continued-unsampled",
+            .op = "http.server",
+        },
+        null,
+        "sentry-trace_id=0123456789abcdef0123456789abcdef,sentry-sample_rate=0.000000",
+    );
+    defer txn.deinit();
+
+    client.finishTransaction(&txn);
+    try testing.expect(client.flush(2000));
+
+    try testing.expectEqual(@as(usize, 0), relay.requestCount());
+}
+
 test "CJM e2e: max_request_body_size drops oversized events" {
     var relay = try CaptureRelay.init(testing.allocator, &.{});
     defer relay.deinit();
@@ -890,6 +929,32 @@ test "CJM e2e: in_app_include marks matching exception frames" {
 
     try testing.expect(relay.containsInAny("\"type\":\"event\""));
     try testing.expect(relay.containsInAny("\"in_app\":true"));
+}
+
+test "CJM e2e: integrations setup callback enriches captured events" {
+    var relay = try CaptureRelay.init(testing.allocator, &.{});
+    defer relay.deinit();
+    try relay.start();
+
+    const local_dsn = try makeLocalDsn(testing.allocator, relay.port());
+    defer testing.allocator.free(local_dsn);
+
+    const client = try sentry.init(testing.allocator, .{
+        .dsn = local_dsn,
+        .integrations = &.{.{
+            .setup = applyCheckoutIntegration,
+        }},
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    client.captureMessage("integration-event", .info);
+    try testing.expect(client.flush(2000));
+    try testing.expect(relay.waitForAtLeast(1, 2000));
+
+    try testing.expect(relay.containsInAny("\"type\":\"event\""));
+    try testing.expect(relay.containsInAny("\"integration\":\"checkout\""));
+    try testing.expect(relay.containsInAny("\"category\":\"integration\""));
 }
 
 // ─── 9. Timestamp Formatting ────────────────────────────────────────────────

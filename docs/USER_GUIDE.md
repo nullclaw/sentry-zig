@@ -87,6 +87,12 @@ Key methods:
 
 If `Options.integrations` is provided, each integration setup callback runs during client initialization.
 
+```zig
+fn setupIntegration(client: *sentry.Client, _: ?*anyopaque) void {
+    client.setTag("integration", "checkout");
+}
+```
+
 ## Event Capture and event_id
 
 ### Message/exception
@@ -300,6 +306,9 @@ var txn2 = try client.startTransactionFromPropagationHeaders(
 );
 defer txn2.deinit();
 ```
+
+If `baggage` contains `sentry-sample_rate` and explicit `sample_rate` is not set in
+transaction options, the SDK uses that propagated sample rate.
 
 Generate downstream propagation headers from a transaction:
 
