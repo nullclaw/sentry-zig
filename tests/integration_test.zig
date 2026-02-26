@@ -626,6 +626,8 @@ test "CJM e2e: transaction is sent when traces sample rate is enabled" {
     try testing.expect(relay.containsInAny("\"transaction\":\"POST /checkout\""));
     try testing.expect(relay.containsInAny("\"op\":\"http.server\""));
     try testing.expect(relay.containsInAny("\"op\":\"db.query\""));
+    try testing.expect(relay.containsInAny("\"trace\":{"));
+    try testing.expect(relay.containsInAny("\"sample_rate\":1.000000"));
     try testing.expect(relay.containsInAny("\"release\":\"checkout@1.2.3\""));
     try testing.expect(relay.containsInAny("\"environment\":\"staging\""));
 }
@@ -686,6 +688,30 @@ test "CJM e2e: monitor check-in inherits client environment" {
     try testing.expect(relay.containsInAny("\"monitor_slug\":\"checkout-cron\""));
     try testing.expect(relay.containsInAny("\"status\":\"in_progress\""));
     try testing.expect(relay.containsInAny("\"environment\":\"production\""));
+}
+
+test "CJM e2e: structured log envelope is sent" {
+    var relay = try CaptureRelay.init(testing.allocator, &.{});
+    defer relay.deinit();
+    try relay.start();
+
+    const local_dsn = try makeLocalDsn(testing.allocator, relay.port());
+    defer testing.allocator.free(local_dsn);
+
+    const client = try sentry.init(testing.allocator, .{
+        .dsn = local_dsn,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    client.captureLogMessage("checkout-log", .warn);
+
+    try testing.expect(client.flush(2000));
+    try testing.expect(relay.waitForAtLeast(1, 2000));
+
+    try testing.expect(relay.containsInAny("\"type\":\"log\""));
+    try testing.expect(relay.containsInAny("\"body\":\"checkout-log\""));
+    try testing.expect(relay.containsInAny("\"level\":\"warn\""));
 }
 
 test "CJM e2e: rate limits drop subsequent error envelopes" {

@@ -56,10 +56,13 @@ exe.root_module.addImport("sentry-zig", sentry_dep.module("sentry-zig"));
 
 - `Client`: owns transport, worker queue, and runtime configuration.
 - `Scope`: mutable event context (user, tags, extras, breadcrumbs, attachments).
+- `Hub`: scope stack + thread-local current hub API for scoped captures.
+- Global helpers via current Hub: `captureMessage`, `captureException`, `addBreadcrumb`, `pushScope`, `configureScope`.
 - `Event`: error/message payload (`captureMessage`, `captureException`, `captureEvent`).
 - `Transaction` + `Span`: tracing payloads (`startTransaction`, `finishTransaction`).
 - `Session`: release health lifecycle (`startSession`, `endSession`).
 - `MonitorCheckIn`: cron monitor status payload (`captureCheckIn`).
+- `LogEntry`: structured log payload (`captureLogMessage`, `captureLog`).
 
 ## Zig-First API
 
@@ -76,15 +79,17 @@ exe.root_module.addImport("sentry-zig", sentry_dep.module("sentry-zig"));
 | Scope enrichment | Implemented | User/tags/extras/contexts/breadcrumbs/fingerprint/transaction |
 | Attachments | Implemented | In-memory and file-backed attachments |
 | Transactions & spans | Implemented | Sampling + trace context serialization |
+| Event trace context bootstrap | Implemented | Captured events receive default `contexts.trace` when absent |
+| Transaction DSC envelope header | Implemented | Envelope header includes `trace_id/public_key/sample_rate/sampled` |
 | Traces sampler callback | Implemented | `traces_sampler` has priority over `traces_sample_rate` |
 | Sessions (application/request mode) | Implemented | Request mode disables duration tracking |
 | Monitor check-ins | Implemented | `check_in` envelopes with env inheritance |
 | Worker + queue draining | Implemented | Bounded queue + `flush`/`close` semantics |
 | Transport rate limits | Implemented | `Retry-After` + `X-Sentry-Rate-Limits` parsing |
 | Signal crash marker flow | Implemented | POSIX marker write/read cycle |
-| Hub/TLS scope stack | Not implemented | Planned area |
-| Extended integrations | Not implemented | Planned area |
-| Structured logs pipeline | Not implemented | Planned area |
+| Hub/TLS scope stack | Implemented | Push/pop scopes + TLS current hub helpers |
+| Structured logs pipeline | Implemented | `log` envelope items + `captureLogMessage` API |
+| Extended integrations | Roadmap | Additional framework/runtime integrations will be added incrementally |
 
 ## Common Usage
 
@@ -104,6 +109,26 @@ if (client.captureMessageId("degraded mode", .warning)) |event_id| {
 client.setUser(.{ .id = "user-42", .email = "user@example.com" });
 client.setTag("feature", "checkout");
 client.addBreadcrumb(.{ .category = "http", .message = "POST /checkout", .level = .info });
+
+// Structured log
+client.captureLogMessage("checkout started", .info);
+```
+
+```zig
+// Hub scope stack
+var hub = try sentry.Hub.init(allocator, client);
+defer hub.deinit();
+
+try hub.pushScope();
+defer _ = hub.popScope();
+
+hub.setTag("flow", "checkout");
+hub.captureMessage("scoped event", .info);
+
+// Optional global API through TLS current hub
+_ = sentry.setCurrentHub(&hub);
+defer _ = sentry.clearCurrentHub();
+_ = sentry.captureMessage("global scoped capture", .warning);
 ```
 
 ## Configuration
@@ -121,6 +146,8 @@ All options are provided via `sentry.Options` in `sentry.init`.
 | `traces_sample_rate` | `f64` | `0.0` | Trace sampling (`0.0..1.0`) |
 | `traces_sampler` | `?TracesSampler` | `null` | Per-transaction sampling callback |
 | `max_breadcrumbs` | `u32` | `100` | Scope breadcrumb cap |
+| `attach_stacktrace` | `bool` | `false` | Attach synthetic thread stacktrace payload when event has no threads |
+| `send_default_pii` | `bool` | `false` | Reserved option for explicit PII policy toggles |
 | `before_send` | `?*const fn (*Event) ?*Event` | `null` | Drop/mutate event before queueing |
 | `before_breadcrumb` | `?*const fn (Breadcrumb) ?Breadcrumb` | `null` | Drop/mutate breadcrumb |
 | `cache_dir` | `[]const u8` | `"/tmp/sentry-zig"` | Crash marker directory |

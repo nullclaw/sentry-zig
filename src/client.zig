@@ -27,6 +27,10 @@ const MonitorCheckIn = @import("monitor.zig").MonitorCheckIn;
 const txn_mod = @import("transaction.zig");
 const Transaction = txn_mod.Transaction;
 const TransactionOpts = txn_mod.TransactionOpts;
+const Uuid = @import("uuid.zig").Uuid;
+const log_mod = @import("log.zig");
+const LogEntry = log_mod.LogEntry;
+const LogLevel = log_mod.LogLevel;
 
 pub const SessionMode = enum {
     application,
@@ -190,6 +194,29 @@ pub const Client = struct {
         _ = self.worker.submit(data, .any);
     }
 
+    /// Capture a structured log item.
+    pub fn captureLog(self: *Client, entry: *const LogEntry) void {
+        if (!self.isEnabled()) return;
+
+        var prepared = entry.*;
+        if (prepared.trace_id == null) {
+            const trace_id = Uuid.v4().toHex();
+            prepared.trace_id = trace_id;
+        }
+
+        const log_json = prepared.toJson(self.allocator) catch return;
+        defer self.allocator.free(log_json);
+
+        const data = self.serializeLogEnvelope(log_json) catch return;
+        _ = self.worker.submit(data, .log_item);
+    }
+
+    /// Capture a simple structured log message.
+    pub fn captureLogMessage(self: *Client, message: []const u8, level: LogLevel) void {
+        var entry = LogEntry.init(message, level);
+        self.captureLog(&entry);
+    }
+
     /// Core method: apply defaults, sample, apply scope, run before_send,
     /// serialize to envelope, and submit to the worker queue.
     pub fn captureEvent(self: *Client, event: *Event) void {
@@ -198,6 +225,11 @@ pub const Client = struct {
 
     /// Capture an event and return its id if accepted by filters/sampling.
     pub fn captureEventId(self: *Client, event: *Event) ?[32]u8 {
+        return self.captureEventIdWithScope(event, &self.scope);
+    }
+
+    /// Capture an event and return its id using the provided scope.
+    pub fn captureEventIdWithScope(self: *Client, event: *Event, source_scope: *Scope) ?[32]u8 {
         if (!self.isEnabled()) return null;
 
         var prepared_event_value = event.*;
@@ -214,10 +246,38 @@ pub const Client = struct {
         }
 
         // Apply scope to event
-        const applied = self.scope.applyToEvent(self.allocator, &prepared_event_value) catch return null;
+        const applied = source_scope.applyToEvent(self.allocator, &prepared_event_value) catch return null;
         defer scope_mod.cleanupAppliedToEvent(self.allocator, &prepared_event_value, applied);
 
         const prepared_event: *Event = &prepared_event_value;
+
+        var owned_trace_contexts: ?json.Value = null;
+        defer if (owned_trace_contexts) |*contexts| {
+            scope_mod.deinitJsonValueDeep(self.allocator, contexts);
+            prepared_event.contexts = null;
+        };
+
+        if (prepared_event.contexts == null) {
+            const contexts = buildDefaultTraceContexts(self.allocator) catch null;
+            if (contexts) |value| {
+                prepared_event.contexts = value;
+                owned_trace_contexts = value;
+            }
+        }
+
+        var owned_threads: ?json.Value = null;
+        defer if (owned_threads) |*threads| {
+            scope_mod.deinitJsonValueDeep(self.allocator, threads);
+            prepared_event.threads = null;
+        };
+
+        if (self.options.attach_stacktrace and prepared_event.threads == null) {
+            const threads = buildSyntheticThreads(self.allocator) catch null;
+            if (threads) |value| {
+                prepared_event.threads = value;
+                owned_threads = value;
+            }
+        }
 
         // Run before_send callback
         if (self.options.before_send) |before_send| {
@@ -252,7 +312,7 @@ pub const Client = struct {
             if (rand_val >= self.options.sample_rate) return null;
         }
 
-        const attachments = self.scope.snapshotAttachments(self.allocator) catch return null;
+        const attachments = source_scope.snapshotAttachments(self.allocator) catch return null;
         defer scope_mod.deinitAttachmentSlice(self.allocator, attachments);
 
         // Serialize event to envelope
@@ -365,6 +425,11 @@ pub const Client = struct {
         try self.scope.tryAddBreadcrumb(crumb);
     }
 
+    /// Clear all breadcrumbs from the scope.
+    pub fn clearBreadcrumbs(self: *Client) void {
+        self.scope.clearBreadcrumbs();
+    }
+
     /// Add an attachment to the scope for future captured events.
     pub fn addAttachment(self: *Client, attachment: Attachment) void {
         self.tryAddAttachment(attachment) catch {};
@@ -458,7 +523,7 @@ pub const Client = struct {
         defer self.allocator.free(txn_json);
 
         // Create transaction envelope
-        const data = self.serializeTransactionEnvelope(txn_json, txn.event_id) catch return;
+        const data = self.serializeTransactionEnvelope(txn, txn_json) catch return;
 
         _ = self.worker.submit(data, .transaction);
     }
@@ -532,6 +597,133 @@ pub const Client = struct {
 
     // ─── Internal Helpers ────────────────────────────────────────────────
 
+    fn putOwnedJsonEntry(
+        allocator: Allocator,
+        object: *json.ObjectMap,
+        key: []const u8,
+        value: json.Value,
+    ) !void {
+        const key_copy = try allocator.dupe(u8, key);
+        errdefer allocator.free(key_copy);
+        try object.put(key_copy, value);
+    }
+
+    fn putOwnedString(
+        allocator: Allocator,
+        object: *json.ObjectMap,
+        key: []const u8,
+        value: []const u8,
+    ) !void {
+        const value_copy = try allocator.dupe(u8, value);
+        errdefer allocator.free(value_copy);
+        try putOwnedJsonEntry(allocator, object, key, .{ .string = value_copy });
+    }
+
+    fn putOwnedBool(
+        allocator: Allocator,
+        object: *json.ObjectMap,
+        key: []const u8,
+        value: bool,
+    ) !void {
+        try putOwnedJsonEntry(allocator, object, key, .{ .bool = value });
+    }
+
+    fn buildDefaultTraceContexts(allocator: Allocator) !json.Value {
+        const trace_id = Uuid.v4().toHex();
+        const span_id = txn_mod.generateSpanId();
+
+        var trace_object = json.ObjectMap.init(allocator);
+        var trace_moved = false;
+        errdefer if (!trace_moved) {
+            var value: json.Value = .{ .object = trace_object };
+            scope_mod.deinitJsonValueDeep(allocator, &value);
+        };
+
+        try putOwnedString(allocator, &trace_object, "type", "trace");
+        try putOwnedString(allocator, &trace_object, "trace_id", &trace_id);
+        try putOwnedString(allocator, &trace_object, "span_id", &span_id);
+        try putOwnedBool(allocator, &trace_object, "sampled", false);
+
+        var contexts_object = json.ObjectMap.init(allocator);
+        errdefer {
+            var value: json.Value = .{ .object = contexts_object };
+            scope_mod.deinitJsonValueDeep(allocator, &value);
+        }
+
+        try putOwnedJsonEntry(allocator, &contexts_object, "trace", .{ .object = trace_object });
+        trace_moved = true;
+        return .{ .object = contexts_object };
+    }
+
+    fn buildSyntheticThreads(allocator: Allocator) !json.Value {
+        var frame_object = json.ObjectMap.init(allocator);
+        var frame_moved = false;
+        errdefer if (!frame_moved) {
+            var value: json.Value = .{ .object = frame_object };
+            scope_mod.deinitJsonValueDeep(allocator, &value);
+        };
+
+        try putOwnedString(allocator, &frame_object, "function", "capture_event");
+        try putOwnedBool(allocator, &frame_object, "in_app", true);
+
+        var frames_array = json.Array.init(allocator);
+        var frames_moved = false;
+        errdefer if (!frames_moved) {
+            var value: json.Value = .{ .array = frames_array };
+            scope_mod.deinitJsonValueDeep(allocator, &value);
+        };
+
+        try frames_array.append(.{ .object = frame_object });
+        frame_moved = true;
+
+        var stacktrace_object = json.ObjectMap.init(allocator);
+        var stacktrace_moved = false;
+        errdefer if (!stacktrace_moved) {
+            var value: json.Value = .{ .object = stacktrace_object };
+            scope_mod.deinitJsonValueDeep(allocator, &value);
+        };
+
+        try putOwnedJsonEntry(allocator, &stacktrace_object, "frames", .{ .array = frames_array });
+        frames_moved = true;
+
+        var thread_object = json.ObjectMap.init(allocator);
+        var thread_moved = false;
+        errdefer if (!thread_moved) {
+            var value: json.Value = .{ .object = thread_object };
+            scope_mod.deinitJsonValueDeep(allocator, &value);
+        };
+
+        try putOwnedBool(allocator, &thread_object, "current", true);
+        try putOwnedJsonEntry(
+            allocator,
+            &thread_object,
+            "stacktrace",
+            .{ .object = stacktrace_object },
+        );
+        stacktrace_moved = true;
+
+        var threads_array = json.Array.init(allocator);
+        var threads_array_moved = false;
+        errdefer if (!threads_array_moved) {
+            var value: json.Value = .{ .array = threads_array };
+            scope_mod.deinitJsonValueDeep(allocator, &value);
+        };
+
+        try threads_array.append(.{ .object = thread_object });
+        thread_moved = true;
+
+        var threads_object = json.ObjectMap.init(allocator);
+        errdefer {
+            var value: json.Value = .{ .object = threads_object };
+            scope_mod.deinitJsonValueDeep(allocator, &value);
+        }
+
+        try putOwnedJsonEntry(allocator, &threads_object, "values", .{ .array = threads_array });
+        threads_array_moved = true;
+
+        return .{ .object = threads_object };
+    }
+
     fn transportSendCallback(data: []const u8, ctx: ?*anyopaque) SendOutcome {
         if (ctx) |ptr| {
             const client: *Client = @ptrCast(@alignCast(ptr));
@@ -579,10 +771,21 @@ pub const Client = struct {
         return try aw.toOwnedSlice();
     }
 
-    fn serializeTransactionEnvelope(self: *Client, txn_json: []const u8, event_id: [32]u8) ![]u8 {
+    fn serializeTransactionEnvelope(self: *Client, txn: *const Transaction, txn_json: []const u8) ![]u8 {
         var aw: Writer.Allocating = .init(self.allocator);
         errdefer aw.deinit();
-        try envelope.serializeTransactionEnvelope(self.dsn, event_id, txn_json, &aw.writer);
+        try envelope.serializeTransactionEnvelopeWithTrace(
+            self.dsn,
+            txn.event_id,
+            txn_json,
+            .{
+                .trace_id = txn.trace_id,
+                .public_key = self.dsn.public_key,
+                .sample_rate = txn.sample_rate,
+                .sampled = txn.sampled,
+            },
+            &aw.writer,
+        );
 
         return try aw.toOwnedSlice();
     }
@@ -591,6 +794,13 @@ pub const Client = struct {
         var aw: Writer.Allocating = .init(self.allocator);
         errdefer aw.deinit();
         try envelope.serializeCheckInEnvelope(self.dsn, check_in_json, &aw.writer);
+        return try aw.toOwnedSlice();
+    }
+
+    fn serializeLogEnvelope(self: *Client, log_json: []const u8) ![]u8 {
+        var aw: Writer.Allocating = .init(self.allocator);
+        errdefer aw.deinit();
+        try envelope.serializeLogEnvelope(self.dsn, log_json, &aw.writer);
         return try aw.toOwnedSlice();
     }
 
@@ -684,6 +894,45 @@ fn neverSampleTraces(_: TracesSamplingContext) f64 {
     return 0.0;
 }
 
+fn hasTraceContext(event: *const Event) bool {
+    if (event.contexts) |contexts| {
+        return switch (contexts) {
+            .object => |obj| obj.get("trace") != null,
+            else => false,
+        };
+    }
+    return false;
+}
+
+fn hasThreadStacktrace(event: *const Event) bool {
+    if (event.threads) |threads| {
+        switch (threads) {
+            .object => |obj| {
+                const values = obj.get("values") orelse return false;
+                return switch (values) {
+                    .array => |arr| arr.items.len > 0,
+                    else => false,
+                };
+            },
+            else => return false,
+        }
+    }
+    return false;
+}
+
+var before_send_saw_trace_context: bool = false;
+var before_send_saw_threads: bool = false;
+
+fn inspectTraceContextBeforeSend(event: *Event) ?*Event {
+    before_send_saw_trace_context = hasTraceContext(event);
+    return event;
+}
+
+fn inspectThreadsBeforeSend(event: *Event) ?*Event {
+    before_send_saw_threads = hasThreadStacktrace(event);
+    return event;
+}
+
 test "Client addBreadcrumb applies before_breadcrumb callback" {
     const client = try Client.init(testing.allocator, .{
         .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
@@ -694,6 +943,50 @@ test "Client addBreadcrumb applies before_breadcrumb callback" {
 
     client.addBreadcrumb(.{ .message = "should-drop" });
     try testing.expectEqual(@as(usize, 0), client.scope.breadcrumbs.count);
+}
+
+test "Client clearBreadcrumbs removes previously added breadcrumbs" {
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    client.addBreadcrumb(.{ .message = "crumb-1" });
+    client.addBreadcrumb(.{ .message = "crumb-2" });
+    try testing.expectEqual(@as(usize, 2), client.scope.breadcrumbs.count);
+
+    client.clearBreadcrumbs();
+    try testing.expectEqual(@as(usize, 0), client.scope.breadcrumbs.count);
+}
+
+test "Client captureMessage injects default trace context into event" {
+    before_send_saw_trace_context = false;
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .before_send = inspectTraceContextBeforeSend,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    try testing.expect(client.captureMessageId("trace-context-message", .info) != null);
+    try testing.expect(before_send_saw_trace_context);
+}
+
+test "Client attach_stacktrace adds synthetic thread stacktrace data" {
+    before_send_saw_threads = false;
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .attach_stacktrace = true,
+        .before_send = inspectThreadsBeforeSend,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    try testing.expect(client.captureMessageId("stacktrace-message", .warning) != null);
+    try testing.expect(before_send_saw_threads);
 }
 
 test "Client auto_session_tracking does not start session without release" {
@@ -780,6 +1073,49 @@ test "Client serializeCheckInEnvelope writes check_in item type" {
 
     try testing.expect(std.mem.indexOf(u8, serialized, "\"type\":\"check_in\"") != null);
     try testing.expect(std.mem.indexOf(u8, serialized, "\"monitor_slug\":\"nightly\"") != null);
+}
+
+test "Client serializeTransactionEnvelope adds dynamic sampling trace header" {
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var txn = client.startTransaction(.{
+        .name = "GET /trace-header",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+
+    const payload = try txn.toJson(testing.allocator);
+    defer testing.allocator.free(payload);
+
+    const serialized = try client.serializeTransactionEnvelope(&txn, payload);
+    defer testing.allocator.free(serialized);
+
+    try testing.expect(std.mem.indexOf(u8, serialized, "\"type\":\"transaction\"") != null);
+    try testing.expect(std.mem.indexOf(u8, serialized, "\"trace\":{") != null);
+    try testing.expect(std.mem.indexOf(u8, serialized, "\"trace_id\":\"") != null);
+    try testing.expect(std.mem.indexOf(u8, serialized, "\"public_key\":\"examplePublicKey\"") != null);
+    try testing.expect(std.mem.indexOf(u8, serialized, "\"sample_rate\":1.000000") != null);
+    try testing.expect(std.mem.indexOf(u8, serialized, "\"sampled\":true") != null);
+}
+
+test "Client serializeLogEnvelope writes log item type" {
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    const payload = "{\"timestamp\":1.0,\"level\":\"info\",\"body\":\"log-entry\"}";
+    const serialized = try client.serializeLogEnvelope(payload);
+    defer testing.allocator.free(serialized);
+
+    try testing.expect(std.mem.indexOf(u8, serialized, "\"type\":\"log\"") != null);
+    try testing.expect(std.mem.indexOf(u8, serialized, "\"body\":\"log-entry\"") != null);
 }
 
 test "Client before_send drops replacement pointers for memory safety" {

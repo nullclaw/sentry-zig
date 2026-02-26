@@ -56,7 +56,7 @@ pub const Stacktrace = struct {
 
 /// A single exception value.
 pub const ExceptionValue = struct {
-    @"type": ?[]const u8 = null,
+    type: ?[]const u8 = null,
     value: ?[]const u8 = null,
     module: ?[]const u8 = null,
     stacktrace: ?Stacktrace = null,
@@ -77,7 +77,7 @@ pub const Message = struct {
 /// A breadcrumb recording an event that happened before the main event.
 pub const Breadcrumb = struct {
     timestamp: ?f64 = null,
-    @"type": ?[]const u8 = null,
+    type: ?[]const u8 = null,
     category: ?[]const u8 = null,
     message: ?[]const u8 = null,
     level: ?Level = null,
@@ -98,6 +98,7 @@ pub const Event = struct {
     transaction: ?[]const u8 = null,
     message: ?Message = null,
     exception: ?ExceptionInterface = null,
+    threads: ?json.Value = null,
     tags: ?json.Value = null,
     extra: ?json.Value = null,
     user: ?User = null,
@@ -159,13 +160,13 @@ test "Event.initMessage sets message correctly" {
 
 test "Event.initException sets exception" {
     const values = [_]ExceptionValue{.{
-        .@"type" = "TypeError",
+        .type = "TypeError",
         .value = "null is not an object",
     }};
     const event = Event.initException(&values);
     try testing.expectEqual(Level.err, event.level.?);
     try testing.expectEqual(@as(usize, 1), event.exception.?.values.len);
-    try testing.expectEqualStrings("TypeError", event.exception.?.values[0].@"type".?);
+    try testing.expectEqualStrings("TypeError", event.exception.?.values[0].type.?);
     try testing.expectEqualStrings("null is not an object", event.exception.?.values[0].value.?);
 }
 

@@ -12,7 +12,14 @@ const ts = @import("timestamp.zig");
 pub const SDK_NAME = "sentry-zig";
 pub const SDK_VERSION = "0.1.0";
 
-fn writeEnvelopeHeader(writer: *Writer, dsn: Dsn, event_id: ?[]const u8) !void {
+pub const TraceHeader = struct {
+    trace_id: [32]u8,
+    public_key: ?[]const u8 = null,
+    sample_rate: ?f64 = null,
+    sampled: ?bool = null,
+};
+
+fn writeEnvelopeHeader(writer: *Writer, dsn: Dsn, event_id: ?[]const u8, trace: ?TraceHeader) !void {
     try writer.writeByte('{');
     if (event_id) |id| {
         try writer.writeAll("\"event_id\":\"");
@@ -28,7 +35,33 @@ fn writeEnvelopeHeader(writer: *Writer, dsn: Dsn, event_id: ?[]const u8) !void {
     try writer.writeAll(SDK_NAME);
     try writer.writeAll("\",\"version\":\"");
     try writer.writeAll(SDK_VERSION);
-    try writer.writeAll("\"}}");
+    try writer.writeByte('"');
+    try writer.writeByte('}');
+
+    if (trace) |trace_header| {
+        try writer.writeAll(",\"trace\":{\"trace_id\":\"");
+        try writer.writeAll(&trace_header.trace_id);
+        try writer.writeByte('"');
+
+        if (trace_header.public_key) |public_key| {
+            try writer.writeAll(",\"public_key\":");
+            try json.Stringify.value(public_key, .{}, writer);
+        }
+
+        if (trace_header.sample_rate) |sample_rate| {
+            try writer.writeAll(",\"sample_rate\":");
+            try writer.print("{d:.6}", .{sample_rate});
+        }
+
+        if (trace_header.sampled) |sampled| {
+            try writer.writeAll(",\"sampled\":");
+            try writer.writeAll(if (sampled) "true" else "false");
+        }
+
+        try writer.writeByte('}');
+    }
+
+    try writer.writeByte('}');
     try writer.writeByte('\n');
 }
 
@@ -67,7 +100,7 @@ pub fn serializeEventEnvelopeWithAttachments(
     );
     defer allocator.free(payload);
 
-    try writeEnvelopeHeader(writer, dsn, &event.event_id);
+    try writeEnvelopeHeader(writer, dsn, &event.event_id, null);
     try writeItemHeader(writer, "event", payload.len);
 
     // Event payload
@@ -100,17 +133,24 @@ pub fn serializeEventEnvelopeWithAttachments(
 ///
 /// Session envelopes do not include event_id in the header.
 pub fn serializeSessionEnvelope(dsn: Dsn, session_json: []const u8, writer: *Writer) !void {
-    try writeEnvelopeHeader(writer, dsn, null);
+    try writeEnvelopeHeader(writer, dsn, null, null);
     try writeItemHeader(writer, "session", session_json.len);
     try writer.writeAll(session_json);
 }
 
 /// Serialize a monitor check-in envelope.
 pub fn serializeCheckInEnvelope(dsn: Dsn, check_in_json: []const u8, writer: *Writer) !void {
-    try writeEnvelopeHeader(writer, dsn, null);
+    try writeEnvelopeHeader(writer, dsn, null, null);
     try writeItemHeader(writer, "check_in", check_in_json.len);
 
     try writer.writeAll(check_in_json);
+}
+
+/// Serialize a structured log envelope.
+pub fn serializeLogEnvelope(dsn: Dsn, log_json: []const u8, writer: *Writer) !void {
+    try writeEnvelopeHeader(writer, dsn, null, null);
+    try writeItemHeader(writer, "log", log_json.len);
+    try writer.writeAll(log_json);
 }
 
 pub fn serializeTransactionEnvelope(
@@ -119,7 +159,17 @@ pub fn serializeTransactionEnvelope(
     transaction_json: []const u8,
     writer: *Writer,
 ) !void {
-    try writeEnvelopeHeader(writer, dsn, &event_id);
+    try serializeTransactionEnvelopeWithTrace(dsn, event_id, transaction_json, null, writer);
+}
+
+pub fn serializeTransactionEnvelopeWithTrace(
+    dsn: Dsn,
+    event_id: [32]u8,
+    transaction_json: []const u8,
+    trace: ?TraceHeader,
+    writer: *Writer,
+) !void {
+    try writeEnvelopeHeader(writer, dsn, &event_id, trace);
     try writeItemHeader(writer, "transaction", transaction_json.len);
     try writer.writeAll(transaction_json);
 }
@@ -276,6 +326,26 @@ test "serializeCheckInEnvelope produces valid format" {
     try testing.expectEqualStrings(check_in_json, line3);
 }
 
+test "serializeLogEnvelope produces valid format" {
+    const dsn = try Dsn.parse("https://key@sentry.example.com/42");
+    const log_json = "{\"timestamp\":1.0,\"level\":\"info\",\"body\":\"hello\"}";
+
+    var aw: Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+
+    try serializeLogEnvelope(dsn, log_json, &aw.writer);
+    const output = aw.written();
+
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    const line1 = lines.next().?;
+    const line2 = lines.next().?;
+    const line3 = lines.rest();
+
+    try testing.expect(std.mem.indexOf(u8, line1, "\"dsn\"") != null);
+    try testing.expect(std.mem.indexOf(u8, line2, "\"type\":\"log\"") != null);
+    try testing.expectEqualStrings(log_json, line3);
+}
+
 test "serializeTransactionEnvelope produces valid format" {
     const dsn = try Dsn.parse("https://key@sentry.example.com/42");
     const transaction_json = "{\"type\":\"transaction\",\"transaction\":\"GET /health\"}";
@@ -300,4 +370,46 @@ test "serializeTransactionEnvelope produces valid format" {
     try testing.expect(std.mem.indexOf(u8, line1, "\"event_id\"") != null);
     try testing.expect(std.mem.indexOf(u8, line2, "\"type\":\"transaction\"") != null);
     try testing.expectEqualStrings(transaction_json, line3);
+}
+
+test "serializeTransactionEnvelopeWithTrace includes dynamic sampling context header" {
+    const dsn = try Dsn.parse("https://public_key@sentry.example.com/42");
+    const transaction_json = "{\"type\":\"transaction\",\"transaction\":\"GET /health\"}";
+    const event_id = [_]u8{
+        '0', '1', '2', '3', '4', '5', '6', '7',
+        '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
+        '0', '1', '2', '3', '4', '5', '6', '7',
+        '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
+    };
+    const trace_id = [_]u8{
+        'f', 'e', 'd', 'c', 'b', 'a', '9', '8',
+        '7', '6', '5', '4', '3', '2', '1', '0',
+        'f', 'e', 'd', 'c', 'b', 'a', '9', '8',
+        '7', '6', '5', '4', '3', '2', '1', '0',
+    };
+
+    var aw: Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+
+    try serializeTransactionEnvelopeWithTrace(
+        dsn,
+        event_id,
+        transaction_json,
+        .{
+            .trace_id = trace_id,
+            .public_key = "public_key",
+            .sample_rate = 1.0,
+            .sampled = true,
+        },
+        &aw.writer,
+    );
+    const output = aw.written();
+
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    const line1 = lines.next().?;
+    try testing.expect(std.mem.indexOf(u8, line1, "\"trace\":{") != null);
+    try testing.expect(std.mem.indexOf(u8, line1, "\"trace_id\":\"fedcba9876543210fedcba9876543210\"") != null);
+    try testing.expect(std.mem.indexOf(u8, line1, "\"public_key\":\"public_key\"") != null);
+    try testing.expect(std.mem.indexOf(u8, line1, "\"sample_rate\":1.000000") != null);
+    try testing.expect(std.mem.indexOf(u8, line1, "\"sampled\":true") != null);
 }

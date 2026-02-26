@@ -352,6 +352,88 @@ pub const Scope = struct {
         };
     }
 
+    /// Create a deep clone of this scope and all owned data.
+    pub fn clone(self: *Scope, allocator: Allocator) !Scope {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var cloned = Scope{
+            .allocator = allocator,
+            .level = self.level,
+            .tags = std.StringHashMap([]const u8).init(allocator),
+            .extra = std.StringHashMap(json.Value).init(allocator),
+            .contexts = std.StringHashMap(json.Value).init(allocator),
+            .breadcrumbs = try BreadcrumbBuffer.init(allocator, self.breadcrumbs.capacity),
+        };
+        errdefer cloned.deinit();
+
+        if (self.user) |u| {
+            cloned.user = try cloneUser(allocator, u);
+        }
+
+        if (self.transaction) |transaction| {
+            cloned.transaction = try allocator.dupe(u8, transaction);
+        }
+
+        if (self.fingerprint.items.len > 0) {
+            try cloned.fingerprint.ensureTotalCapacity(allocator, self.fingerprint.items.len);
+            for (self.fingerprint.items) |item| {
+                try cloned.fingerprint.append(allocator, try allocator.dupe(u8, item));
+            }
+        }
+
+        var tag_it = self.tags.iterator();
+        while (tag_it.next()) |entry| {
+            const key_copy = try allocator.dupe(u8, entry.key_ptr.*);
+            errdefer allocator.free(key_copy);
+            const value_copy = try allocator.dupe(u8, entry.value_ptr.*);
+            errdefer allocator.free(value_copy);
+            try cloned.tags.put(key_copy, value_copy);
+        }
+
+        var extra_it = self.extra.iterator();
+        while (extra_it.next()) |entry| {
+            const key_copy = try allocator.dupe(u8, entry.key_ptr.*);
+            errdefer allocator.free(key_copy);
+            var value_copy = try cloneJsonValue(allocator, entry.value_ptr.*);
+            errdefer deinitJsonValueDeep(allocator, &value_copy);
+            try cloned.extra.put(key_copy, value_copy);
+        }
+
+        var context_it = self.contexts.iterator();
+        while (context_it.next()) |entry| {
+            const key_copy = try allocator.dupe(u8, entry.key_ptr.*);
+            errdefer allocator.free(key_copy);
+            var value_copy = try cloneJsonValue(allocator, entry.value_ptr.*);
+            errdefer deinitJsonValueDeep(allocator, &value_copy);
+            try cloned.contexts.put(key_copy, value_copy);
+        }
+
+        if (self.attachments.items.len > 0) {
+            try cloned.attachments.ensureTotalCapacity(allocator, self.attachments.items.len);
+            for (self.attachments.items) |attachment| {
+                var owned = try attachment.clone(allocator);
+                errdefer owned.deinit(allocator);
+                try cloned.attachments.append(allocator, owned);
+            }
+        }
+
+        if (self.event_processors.items.len > 0) {
+            try cloned.event_processors.appendSlice(allocator, self.event_processors.items);
+        }
+
+        if (self.breadcrumbs.count > 0) {
+            const ordered = try self.breadcrumbs.toSlice(allocator);
+            defer allocator.free(ordered);
+            for (ordered) |crumb| {
+                const cloned_crumb = try cloneBreadcrumb(allocator, crumb);
+                cloned.breadcrumbs.push(cloned_crumb);
+            }
+        }
+
+        return cloned;
+    }
+
     pub fn deinit(self: *Scope) void {
         if (self.user) |*u| {
             deinitUserDeep(self.allocator, u);
@@ -594,6 +676,13 @@ pub const Scope = struct {
             owned.timestamp = ts.now();
         }
         self.breadcrumbs.push(owned);
+    }
+
+    /// Clear all breadcrumbs from the scope.
+    pub fn clearBreadcrumbs(self: *Scope) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.breadcrumbs.clear();
     }
 
     /// Add an attachment to the scope. The scope stores an owned clone.
@@ -1164,6 +1253,18 @@ test "Scope removeExtra and removeContext remove owned values" {
 
     try testing.expect(scope.extra.get("extra-key") == null);
     try testing.expect(scope.contexts.get("ctx-key") == null);
+}
+
+test "Scope clearBreadcrumbs removes stored breadcrumbs" {
+    var scope = try Scope.init(testing.allocator, 10);
+    defer scope.deinit();
+
+    scope.addBreadcrumb(.{ .message = "crumb-1" });
+    scope.addBreadcrumb(.{ .message = "crumb-2" });
+    try testing.expectEqual(@as(usize, 2), scope.breadcrumbs.count);
+
+    scope.clearBreadcrumbs();
+    try testing.expectEqual(@as(usize, 0), scope.breadcrumbs.count);
 }
 
 test "Scope level overrides event level during applyToEvent" {

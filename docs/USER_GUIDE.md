@@ -14,12 +14,13 @@
 7. [Трейсинг и транзакции](#трейсинг-и-транзакции)
 8. [Release Health Sessions](#release-health-sessions)
 9. [Monitor Check-Ins](#monitor-check-ins)
-10. [Hooks и процессоры](#hooks-и-процессоры)
-11. [Rate limits и очередь](#rate-limits-и-очередь)
-12. [Crash handling (POSIX)](#crash-handling-posix)
-13. [Production checklist](#production-checklist)
-14. [Troubleshooting](#troubleshooting)
-15. [Статус SDK](#статус-sdk)
+10. [Structured Logs](#structured-logs)
+11. [Hooks и процессоры](#hooks-и-процессоры)
+12. [Rate limits и очередь](#rate-limits-и-очередь)
+13. [Crash handling (POSIX)](#crash-handling-posix)
+14. [Production checklist](#production-checklist)
+15. [Troubleshooting](#troubleshooting)
+16. [Статус SDK](#статус-sdk)
 
 ## Быстрый старт
 
@@ -131,6 +132,7 @@ client.removeUser();
 client.removeTag("feature");
 client.removeExtra("order_id");
 client.removeContext("region");
+client.clearBreadcrumbs();
 ```
 
 Дополнительно:
@@ -141,6 +143,34 @@ client.removeContext("region");
 - `trySetUser`, `trySetTag`, `trySetExtra`, `trySetContext`
 - `trySetTransaction`, `trySetFingerprint`
 - `tryAddBreadcrumb`, `tryAddAttachment`, `tryAddEventProcessor`
+
+### Hub и scope stack
+
+Для изолированных scope-блоков используйте `Hub`:
+
+```zig
+var hub = try sentry.Hub.init(allocator, client);
+defer hub.deinit();
+
+try hub.pushScope();
+defer _ = hub.popScope();
+
+hub.setTag("stage", "checkout");
+hub.captureMessage("scoped event", .info);
+```
+
+TLS helper-методы:
+- `sentry.setCurrentHub(&hub)`
+- `sentry.currentHub()`
+- `sentry.clearCurrentHub()`
+
+После `setCurrentHub` можно использовать глобальные helper-вызовы:
+- `sentry.captureMessage(...)`
+- `sentry.captureException(...)`
+- `sentry.addBreadcrumb(...)` / `sentry.clearBreadcrumbs()`
+- `sentry.pushScope()` / `sentry.popScope()`
+- `sentry.withScope(...)`
+- `sentry.configureScope(...)`
 
 ## Attachments
 
@@ -223,6 +253,23 @@ const client = try sentry.init(allocator, .{
 
 `traces_sampler` имеет приоритет над `traces_sample_rate`.
 
+Для обычных event-сообщений SDK автоматически добавляет `contexts.trace`,
+если trace context отсутствует во входном событии.
+Для transaction envelope SDK добавляет динамический trace header
+(`trace_id/public_key/sample_rate/sampled`).
+
+### attach_stacktrace
+
+```zig
+const client = try sentry.init(allocator, .{
+    .dsn = "...",
+    .attach_stacktrace = true,
+});
+```
+
+При `attach_stacktrace=true` SDK добавляет thread stacktrace payload для событий,
+где `threads` не заполнены.
+
 ## Release Health Sessions
 
 ### Ручной режим
@@ -260,6 +307,18 @@ client.captureCheckIn(&check_in);
 ```
 
 Если `check_in.environment == null`, SDK подставляет `Options.environment`.
+
+## Structured Logs
+
+```zig
+client.captureLogMessage("checkout started", .info);
+
+var log_entry = sentry.LogEntry.init("payment provider timeout", .err);
+client.captureLog(&log_entry);
+```
+
+Для расширенных полей можно задать `LogEntry.attributes` и `LogEntry.trace_id`
+перед отправкой.
 
 ## Hooks и процессоры
 
@@ -356,10 +415,8 @@ Worker учитывает:
 - monitor check-ins,
 - worker + transport rate limits.
 
-Не реализовано на текущий момент:
-- Hub model и TLS scope stack,
-- расширенная экосистема интеграций,
-- structured logs pipeline.
+Roadmap:
+- расширенная экосистема интеграций.
 
 Для трекинга изменений используйте историю коммитов и интеграционные тесты
 в `tests/integration_test.zig`.
