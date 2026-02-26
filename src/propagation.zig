@@ -183,7 +183,7 @@ pub fn parseBaggage(header_value: []const u8) ParsedBaggage {
         const value = std.mem.trim(u8, field[eq_index + 1 ..], " \t");
         if (value.len == 0) continue;
 
-        if (std.mem.eql(u8, key, "sentry-trace_id")) {
+        if (equalsAsciiIgnoreCase(key, "sentry-trace_id")) {
             if (isHex(value, 32)) {
                 var trace_id: [32]u8 = undefined;
                 @memcpy(trace_id[0..], value);
@@ -191,27 +191,27 @@ pub fn parseBaggage(header_value: []const u8) ParsedBaggage {
             }
             continue;
         }
-        if (std.mem.eql(u8, key, "sentry-public_key")) {
+        if (equalsAsciiIgnoreCase(key, "sentry-public_key")) {
             parsed.public_key = value;
             continue;
         }
-        if (std.mem.eql(u8, key, "sentry-release")) {
+        if (equalsAsciiIgnoreCase(key, "sentry-release")) {
             parsed.release = value;
             continue;
         }
-        if (std.mem.eql(u8, key, "sentry-environment")) {
+        if (equalsAsciiIgnoreCase(key, "sentry-environment")) {
             parsed.environment = value;
             continue;
         }
-        if (std.mem.eql(u8, key, "sentry-transaction")) {
+        if (equalsAsciiIgnoreCase(key, "sentry-transaction")) {
             parsed.transaction = value;
             continue;
         }
-        if (std.mem.eql(u8, key, "sentry-sample_rate")) {
+        if (equalsAsciiIgnoreCase(key, "sentry-sample_rate")) {
             parsed.sample_rate = std.fmt.parseFloat(f64, value) catch null;
             continue;
         }
-        if (std.mem.eql(u8, key, "sentry-sampled")) {
+        if (equalsAsciiIgnoreCase(key, "sentry-sampled")) {
             parsed.sampled = parseSampledBool(value);
             continue;
         }
@@ -245,8 +245,8 @@ fn parseSampled(sampled_text: []const u8) ?bool {
 }
 
 fn parseSampledBool(sampled_text: []const u8) ?bool {
-    if (std.mem.eql(u8, sampled_text, "1") or std.mem.eql(u8, sampled_text, "true")) return true;
-    if (std.mem.eql(u8, sampled_text, "0") or std.mem.eql(u8, sampled_text, "false")) return false;
+    if (std.mem.eql(u8, sampled_text, "1") or std.ascii.eqlIgnoreCase(sampled_text, "true")) return true;
+    if (std.mem.eql(u8, sampled_text, "0") or std.ascii.eqlIgnoreCase(sampled_text, "false")) return false;
     return null;
 }
 
@@ -286,6 +286,10 @@ fn isHex(value: []const u8, expected_len: usize) bool {
         if (!std.ascii.isHex(c)) return false;
     }
     return true;
+}
+
+fn equalsAsciiIgnoreCase(left: []const u8, right: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(left, right);
 }
 
 fn appendBaggagePair(w: *Writer, first: *bool, key: []const u8, value: []const u8) !void {
@@ -376,6 +380,17 @@ test "parseBaggage extracts sentry keys" {
     try testing.expectEqualStrings("pub", parsed.public_key.?);
     try testing.expectEqual(@as(?f64, 0.75), parsed.sample_rate);
     try testing.expectEqual(@as(?bool, false), parsed.sampled);
+}
+
+test "parseBaggage accepts mixed-case sentry keys" {
+    const parsed = parseBaggage(
+        "Sentry-Trace_ID=fedcba9876543210fedcba9876543210,SENTRY-PUBLIC_KEY=pub,Sentry-SAMPLED=TRUE",
+    );
+
+    try testing.expect(parsed.trace_id != null);
+    try testing.expectEqualStrings("fedcba9876543210fedcba9876543210", parsed.trace_id.?[0..]);
+    try testing.expectEqualStrings("pub", parsed.public_key.?);
+    try testing.expectEqual(@as(?bool, true), parsed.sampled);
 }
 
 test "parseBaggageAlloc decodes percent-encoded values" {
