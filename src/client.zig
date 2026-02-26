@@ -1153,6 +1153,8 @@ pub const Client = struct {
     }
 
     fn sendSessionUpdate(self: *Client, session: *Session) bool {
+        self.ensureSessionDistinctId(session);
+
         const session_json = session.toJson(self.allocator) catch return false;
         defer self.allocator.free(session_json);
 
@@ -1196,6 +1198,14 @@ pub const Client = struct {
         const user = self.scope.user orelse return null;
         const candidate = user.id orelse user.email orelse user.username orelse return null;
         return self.allocator.dupe(u8, candidate) catch null;
+    }
+
+    fn ensureSessionDistinctId(self: *Client, session: *Session) void {
+        if (session.did != null) return;
+        if (self.session_did == null) {
+            self.session_did = self.resolveSessionDistinctIdAlloc();
+        }
+        session.did = self.session_did;
     }
 
     fn submitEnvelope(self: *Client, data: []u8, category: RateLimitCategory) bool {
@@ -2390,6 +2400,34 @@ test "Client session distinct id falls back to email then username" {
     try testing.expect(client.session != null);
     try testing.expect(client.session.?.did != null);
     try testing.expectEqualStrings("fallback-user", client.session.?.did.?);
+}
+
+test "Client session distinct id can be populated after session start" {
+    var state = PayloadTransportState.init(testing.allocator);
+    defer state.deinit();
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .release = "my-app@1.0.0",
+        .transport = .{
+            .send_fn = payloadTransportSendFn,
+            .ctx = &state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    client.startSession();
+    try testing.expect(client.session != null);
+    try testing.expect(client.session.?.did == null);
+
+    client.setUser(.{ .id = "late-user" });
+    client.endSession(.exited);
+    _ = client.flush(1000);
+
+    try testing.expectEqual(@as(usize, 1), state.sent_count);
+    try testing.expect(state.last_payload != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"did\":\"late-user\"") != null);
 }
 
 test "Client session counts errors even when events are sampled out" {

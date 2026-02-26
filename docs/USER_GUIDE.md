@@ -359,6 +359,7 @@ client.endSession(.exited);
 
 If `Scope.user` is set before `startSession`, session `did` is derived from user context
 in priority order: `id`, then `email`, then `username`.
+If user context is set after `startSession`, `did` is attached on the next session update.
 
 ### Auto mode
 

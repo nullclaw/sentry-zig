@@ -851,6 +851,33 @@ test "CJM e2e: session distinct id is derived from scope user" {
     try testing.expect(relay.containsInAny("\"did\":\"user-42\""));
 }
 
+test "CJM e2e: session distinct id can be set after session start" {
+    var relay = try CaptureRelay.init(testing.allocator, &.{});
+    defer relay.deinit();
+    try relay.start();
+
+    const local_dsn = try makeLocalDsn(testing.allocator, relay.port());
+    defer testing.allocator.free(local_dsn);
+
+    const client = try sentry.init(testing.allocator, .{
+        .dsn = local_dsn,
+        .release = "checkout@1.2.3",
+        .environment = "production",
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    client.startSession();
+    client.setUser(.{ .id = "late-user" });
+    client.endSession(.exited);
+
+    try testing.expect(client.flush(2000));
+    try testing.expect(relay.waitForAtLeast(1, 2000));
+
+    try testing.expect(relay.containsInAny("\"type\":\"session\""));
+    try testing.expect(relay.containsInAny("\"did\":\"late-user\""));
+}
+
 test "CJM e2e: monitor check-in inherits client environment" {
     var relay = try CaptureRelay.init(testing.allocator, &.{});
     defer relay.deinit();
