@@ -625,6 +625,17 @@ pub const Client = struct {
         return Transaction.init(self.allocator, real_opts);
     }
 
+    /// Start a new transaction using an explicit start timestamp.
+    pub fn startTransactionWithTimestamp(
+        self: *Client,
+        opts: TransactionOpts,
+        start_timestamp: f64,
+    ) Transaction {
+        var real_opts = opts;
+        real_opts.start_timestamp = start_timestamp;
+        return self.startTransaction(real_opts);
+    }
+
     /// Start a transaction using upstream `sentry-trace` header context.
     pub fn startTransactionFromSentryTrace(
         self: *Client,
@@ -2187,6 +2198,24 @@ test "Client traces_sampler overrides traces_sample_rate" {
 
     try testing.expectEqual(@as(f64, 0.0), never_txn.sample_rate);
     try testing.expect(!never_txn.sampled);
+}
+
+test "Client startTransactionWithTimestamp applies explicit start timestamp" {
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    const explicit_start = 1704067200.125;
+    var txn = client.startTransactionWithTimestamp(.{
+        .name = "GET /with-start",
+        .op = "http.server",
+    }, explicit_start);
+    defer txn.deinit();
+
+    try testing.expectEqual(explicit_start, txn.start_timestamp);
 }
 
 test "Client startTransaction normalizes invalid explicit sample rates" {

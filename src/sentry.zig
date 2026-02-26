@@ -91,6 +91,11 @@ pub fn startTransaction(opts: TransactionOpts) ?Transaction {
     return hub.startTransaction(opts);
 }
 
+pub fn startTransactionWithTimestamp(opts: TransactionOpts, start_timestamp: f64) ?Transaction {
+    const hub = Hub.current() orelse return null;
+    return hub.startTransactionWithTimestamp(opts, start_timestamp);
+}
+
 pub fn startTransactionFromSentryTrace(opts: TransactionOpts, sentry_trace_header: []const u8) ?Transaction {
     const hub = Hub.current() orelse return null;
     return hub.startTransactionFromSentryTrace(opts, sentry_trace_header) catch null;
@@ -237,6 +242,7 @@ test "global wrappers are safe no-op without current hub" {
     var check_in = MonitorCheckIn.init("no-hub", .in_progress);
     try std.testing.expect(!captureCheckIn(&check_in));
     try std.testing.expect(startTransaction(.{ .name = "no-hub" }) == null);
+    try std.testing.expect(startTransactionWithTimestamp(.{ .name = "no-hub" }, 1704067200.125) == null);
     try std.testing.expect(startTransactionFromSentryTrace(
         .{ .name = "no-hub" },
         "0123456789abcdef0123456789abcdef-89abcdef01234567-1",
@@ -310,6 +316,14 @@ test "global wrappers route through current hub" {
     try std.testing.expect(std.mem.indexOf(u8, tx_trace_header, txn.trace_id[0..]) != null);
     try std.testing.expect(std.mem.indexOf(u8, tx_baggage, "sentry-trace_id=") != null);
     try std.testing.expect(finishTransaction(&txn));
+
+    const explicit_start = 1704067200.125;
+    var timed_txn = startTransactionWithTimestamp(
+        .{ .name = "GET /global-timed", .op = "http.server" },
+        explicit_start,
+    ).?;
+    defer timed_txn.deinit();
+    try std.testing.expectEqual(explicit_start, timed_txn.start_timestamp);
 
     var continued = startTransactionFromSentryTrace(
         .{ .name = "GET /continued-global", .op = "http.server" },

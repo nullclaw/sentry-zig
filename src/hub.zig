@@ -264,6 +264,14 @@ pub const Hub = struct {
         return self.client.startTransaction(opts);
     }
 
+    pub fn startTransactionWithTimestamp(
+        self: *Hub,
+        opts: TransactionOpts,
+        start_timestamp: f64,
+    ) Transaction {
+        return self.client.startTransactionWithTimestamp(opts, start_timestamp);
+    }
+
     pub fn startTransactionFromSentryTrace(
         self: *Hub,
         opts: TransactionOpts,
@@ -478,6 +486,27 @@ test "Hub startTransactionFromPropagationHeaders continues upstream trace" {
     try testing.expectEqualStrings("0123456789abcdef0123456789abcdef", txn.trace_id[0..]);
     try testing.expect(txn.parent_span_id != null);
     try testing.expectEqualStrings("89abcdef01234567", txn.parent_span_id.?[0..]);
+}
+
+test "Hub startTransactionWithTimestamp applies explicit start timestamp" {
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var hub = try Hub.init(testing.allocator, client);
+    defer hub.deinit();
+
+    const explicit_start = 1704067200.125;
+    var txn = hub.startTransactionWithTimestamp(.{
+        .name = "GET /hub-start",
+        .op = "http.server",
+    }, explicit_start);
+    defer txn.deinit();
+
+    try testing.expectEqual(explicit_start, txn.start_timestamp);
 }
 
 test "Hub TLS current set and clear" {

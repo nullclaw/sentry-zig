@@ -150,6 +150,12 @@ var txn2 = try client.startTransactionFromPropagationHeaders(
     incoming_baggage,
 );
 defer txn2.deinit();
+// Optional explicit start timestamp (seconds, unix epoch)
+var timed_txn = client.startTransactionWithTimestamp(
+    .{ .name = "GET /orders-backdated", .op = "http.server" },
+    1704067200.125,
+);
+defer timed_txn.deinit();
 // `sentry-sample_rate` from baggage is honored when transaction opts use default sample_rate.
 // Third-party baggage members are preserved when generating downstream baggage headers.
 

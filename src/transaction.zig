@@ -76,6 +76,7 @@ pub const TransactionOpts = struct {
     name: []const u8,
     op: ?[]const u8 = null,
     description: ?[]const u8 = null,
+    start_timestamp: ?f64 = null,
     sampled: bool = true,
     sample_rate: f64 = 1.0,
     release: ?[]const u8 = null,
@@ -144,7 +145,7 @@ pub const Transaction = struct {
             .name = opts.name,
             .op = opts.op,
             .description = opts.description,
-            .start_timestamp = ts.now(),
+            .start_timestamp = opts.start_timestamp orelse ts.now(),
             .allocator = allocator,
             .sampled = opts.sampled,
             .sample_rate = opts.sample_rate,
@@ -376,6 +377,17 @@ test "Transaction.init supports parent trace context" {
     try testing.expect(txn.parent_span_id != null);
     try testing.expectEqualSlices(u8, &parent_span_id, &txn.parent_span_id.?);
     try testing.expectEqual(@as(?bool, true), txn.parent_sampled);
+}
+
+test "Transaction.init uses explicit start timestamp when provided" {
+    const explicit_start = 1704067200.125;
+    var txn = Transaction.init(testing.allocator, .{
+        .name = "GET /timestamp",
+        .start_timestamp = explicit_start,
+    });
+    defer txn.deinit();
+
+    try testing.expectEqual(explicit_start, txn.start_timestamp);
 }
 
 test "Transaction.startChild keeps span pointers stable across growth" {

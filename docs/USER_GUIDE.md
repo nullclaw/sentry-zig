@@ -236,6 +236,13 @@ var txn = client.startTransaction(.{
 });
 defer txn.deinit();
 
+// Optional explicit start timestamp (seconds, unix epoch)
+var timed_txn = client.startTransactionWithTimestamp(.{
+    .name = "POST /checkout-backdated",
+    .op = "http.server",
+}, 1704067200.125);
+defer timed_txn.deinit();
+
 const span = try txn.startChild(.{
     .op = "db.query",
     .description = "INSERT INTO orders",

@@ -678,6 +678,37 @@ test "CJM e2e: transaction is sent when traces sample rate is enabled" {
     try testing.expect(relay.containsInAny("\"environment\":\"staging\""));
 }
 
+test "CJM e2e: transaction start timestamp can be set explicitly" {
+    var relay = try CaptureRelay.init(testing.allocator, &.{});
+    defer relay.deinit();
+    try relay.start();
+
+    const local_dsn = try makeLocalDsn(testing.allocator, relay.port());
+    defer testing.allocator.free(local_dsn);
+
+    const client = try sentry.init(testing.allocator, .{
+        .dsn = local_dsn,
+        .traces_sample_rate = 1.0,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    const explicit_start = 1704067200.125;
+    var txn = client.startTransactionWithTimestamp(.{
+        .name = "POST /checkout-explicit-start",
+        .op = "http.server",
+    }, explicit_start);
+    defer txn.deinit();
+
+    client.finishTransaction(&txn);
+    try testing.expect(client.flush(2000));
+    try testing.expect(relay.waitForAtLeast(1, 2000));
+
+    try testing.expect(relay.containsInAny("\"type\":\"transaction\""));
+    try testing.expect(relay.containsInAny("\"transaction\":\"POST /checkout-explicit-start\""));
+    try testing.expect(relay.containsInAny("\"start_timestamp\":1704067200.125"));
+}
+
 test "CJM e2e: before_send_transaction can drop transactions" {
     var relay = try CaptureRelay.init(testing.allocator, &.{});
     defer relay.deinit();
