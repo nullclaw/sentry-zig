@@ -859,12 +859,17 @@ test "CJM e2e: global transaction API uses current hub scope metadata" {
     try hub.trySetTag("hub-global-tag", "checkout");
     try hub.trySetExtra("hub-global-extra", .{ .integer = 5 });
     try hub.trySetContext("hub-global-context", .{ .integer = 6 });
+    try hub.trySetTransaction("hub-global-name");
 
     var txn = sentry.startTransaction(.{
         .name = "POST /checkout-global",
         .op = "http.server",
     }).?;
     defer txn.deinit();
+    try txn.setRequest(.{
+        .method = "GET",
+        .url = "https://honk.beep",
+    });
 
     try testing.expect(sentry.finishTransaction(&txn));
     try testing.expect(client.flush(2000));
@@ -874,6 +879,8 @@ test "CJM e2e: global transaction API uses current hub scope metadata" {
     try testing.expect(relay.containsInAny("\"hub-global-tag\":\"checkout\""));
     try testing.expect(relay.containsInAny("\"hub-global-extra\":5"));
     try testing.expect(relay.containsInAny("\"hub-global-context\":6"));
+    try testing.expect(relay.containsInAny("\"transaction\":\"hub-global-name\""));
+    try testing.expect(relay.containsInAny("\"url\":\"https://honk.beep\""));
 }
 
 test "CJM e2e: transaction and span request metadata is serialized" {

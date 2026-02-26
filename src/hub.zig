@@ -783,16 +783,22 @@ test "Hub finishTransaction applies top scope transaction metadata" {
     try client.trySetTag("client-only-tag", "client");
     try client.trySetExtra("client-only-extra", .{ .integer = 11 });
     try client.trySetContext("client-only-context", .{ .integer = 12 });
+    try client.trySetTransaction("client-name");
 
     try hub.trySetTag("hub-tag", "hub");
     try hub.trySetExtra("hub-extra", .{ .integer = 21 });
     try hub.trySetContext("hub-context", .{ .integer = 22 });
+    try hub.trySetTransaction("hub-name");
 
     var txn = hub.startTransaction(.{
         .name = "POST /hub-finish-scope",
         .op = "http.server",
     });
     defer txn.deinit();
+    try txn.setRequest(.{
+        .method = "GET",
+        .url = "https://honk.beep",
+    });
 
     hub.finishTransaction(&txn);
     _ = client.flush(1000);
@@ -802,9 +808,12 @@ test "Hub finishTransaction applies top scope transaction metadata" {
     try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"hub-tag\":\"hub\"") != null);
     try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"hub-extra\":21") != null);
     try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"hub-context\":22") != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"transaction\":\"hub-name\"") != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"url\":\"https://honk.beep\"") != null);
     try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"client-only-tag\":\"client\"") == null);
     try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"client-only-extra\":11") == null);
     try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"client-only-context\":12") == null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"transaction\":\"client-name\"") == null);
 }
 
 test "Hub TLS current set and clear" {
