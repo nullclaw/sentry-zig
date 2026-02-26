@@ -87,7 +87,7 @@ pub const Session = struct {
 
     /// End the session with the given status, computing duration.
     pub fn end(self: *Session, status: SessionStatus) void {
-        self.status = status;
+        self.status = if (status == .ok) .exited else status;
         self.touch();
         if (self.track_duration) {
             self.duration = self.timestamp - self.started;
@@ -222,6 +222,12 @@ test "Session.end sets duration and status" {
     try testing.expect(session.duration != null);
     try testing.expect(session.duration.? >= 0.0);
     try testing.expect(session.sequence > before_seq);
+}
+
+test "Session.end maps ok status to exited" {
+    var session = Session.start("app@1.0", "dev");
+    session.end(.ok);
+    try testing.expectEqual(SessionStatus.exited, session.status);
 }
 
 test "Session.startWithMode disables duration in request mode" {
