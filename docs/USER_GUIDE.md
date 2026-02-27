@@ -173,6 +173,24 @@ const client = try sentry.init(allocator, .{
 defer client.deinit();
 ```
 
+Or initialize via helper that prepends built-ins and creates client:
+
+```zig
+const client = try sentry.integrations.auto.initWithDefaults(allocator, .{
+    .dsn = "https://PUBLIC_KEY@o0.ingest.sentry.io/PROJECT_ID",
+});
+defer client.deinit();
+```
+
+Global variant (binds current TLS hub):
+
+```zig
+var guard = try sentry.integrations.auto.initGlobalWithDefaults(allocator, .{
+    .dsn = "https://PUBLIC_KEY@o0.ingest.sentry.io/PROJECT_ID",
+});
+defer guard.deinit();
+```
+
 ### panic integration helper
 
 Forward panics to Sentry before Zig default panic handling:

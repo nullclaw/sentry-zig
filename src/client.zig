@@ -163,6 +163,7 @@ pub const Client = struct {
     log_batch_first_timestamp_ns: ?i128 = null,
     log_batch_shutdown: bool = false,
     log_batch_thread: ?std.Thread = null,
+    owned_integrations: ?[]Integration = null,
 
     /// Initialize a new Client. Heap-allocates the Client struct so that
     /// internal pointers (e.g., the Worker's send_ctx) remain stable.
@@ -194,10 +195,21 @@ pub const Client = struct {
             default_server_name = detectServerNameAlloc(allocator);
         }
 
+        var owned_integrations: ?[]Integration = null;
+        errdefer if (owned_integrations) |values| allocator.free(values);
+        if (options.integrations) |integrations| {
+            const copied = try allocator.alloc(Integration, integrations.len);
+            @memcpy(copied, integrations);
+            owned_integrations = copied;
+        }
+
+        var effective_options = options;
+        effective_options.integrations = if (owned_integrations) |values| values else null;
+
         self.* = Client{
             .allocator = allocator,
             .dsn = dsn,
-            .options = options,
+            .options = effective_options,
             .scope = scope,
             .transport = transport,
             .worker = worker,
@@ -205,9 +217,10 @@ pub const Client = struct {
             .session_did = null,
             .session = null,
             .last_event_id = null,
+            .owned_integrations = owned_integrations,
         };
 
-        if (options.integrations) |integrations| {
+        if (self.options.integrations) |integrations| {
             for (integrations) |integration| {
                 integration.setup(self, integration.ctx);
             }
@@ -251,6 +264,7 @@ pub const Client = struct {
         self.scope.deinit();
         if (self.default_server_name) |name| self.allocator.free(name);
         if (self.session_did) |did| self.allocator.free(did);
+        if (self.owned_integrations) |values| self.allocator.free(values);
         self.deinitSessionAggregates();
 
         const allocator = self.allocator;
@@ -2154,6 +2168,37 @@ test "Client withIntegration reports null context when integration is missing" {
     try testing.expect(integration_lookup_called);
     try testing.expect(integration_lookup_received_null);
     try testing.expectEqual(@as(?bool, null), integration_lookup_flag_value);
+}
+
+test "Client owns copied integrations slice and is independent from caller memory" {
+    integration_lookup_called = false;
+    integration_lookup_received_null = false;
+    integration_lookup_flag_value = null;
+
+    var called = false;
+    var integrations = [_]Integration{
+        .{
+            .setup = testIntegrationSetup,
+            .ctx = &called,
+        },
+    };
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .integrations = integrations[0..],
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    try testing.expect(called);
+
+    integrations[0].setup = otherIntegrationSetup;
+    integrations[0].ctx = null;
+
+    try testing.expect(client.withIntegration(testIntegrationSetup, inspectIntegrationLookup));
+    try testing.expect(integration_lookup_called);
+    try testing.expect(!integration_lookup_received_null);
+    try testing.expectEqual(@as(?bool, true), integration_lookup_flag_value);
 }
 
 fn dropBreadcrumb(_: Breadcrumb) ?Breadcrumb {

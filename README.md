@@ -306,6 +306,14 @@ defer client.deinit();
 ```
 
 ```zig
+// Full bootstrap helper that prepends built-ins and initializes client directly
+const client = try sentry.integrations.auto.initWithDefaults(allocator, .{
+    .dsn = "https://PUBLIC_KEY@o0.ingest.sentry.io/PROJECT_ID",
+});
+defer client.deinit();
+```
+
+```zig
 // HTTP request helper: starts/continues trace, binds per-request hub, maps status
 var req_ctx = try sentry.integrations.http.RequestContext.begin(allocator, client, .{
     .name = "GET /orders/:id",
