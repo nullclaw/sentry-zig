@@ -36,7 +36,7 @@ pub const RequestContext = struct {
     allocator: std.mem.Allocator,
     hub: *Hub,
     previous_hub: ?*Hub,
-    txn: Transaction,
+    txn: *Transaction,
     finished: bool = false,
     active: bool = true,
     response_status_code: ?u16 = null,
@@ -70,7 +70,10 @@ pub const RequestContext = struct {
             .name = options.name,
             .op = options.op,
         };
-        var txn = if (options.sentry_trace_header != null or options.baggage_header != null)
+        const txn_ptr = try allocator.create(Transaction);
+        errdefer allocator.destroy(txn_ptr);
+
+        txn_ptr.* = if (options.sentry_trace_header != null or options.baggage_header != null)
             try hub_ptr.startTransactionFromPropagationHeaders(
                 txn_opts,
                 options.sentry_trace_header,
@@ -78,14 +81,14 @@ pub const RequestContext = struct {
             )
         else
             hub_ptr.startTransaction(txn_opts);
-        errdefer txn.deinit();
+        errdefer txn_ptr.deinit();
 
         if (options.origin) |origin| {
-            try txn.setOrigin(origin);
+            try txn_ptr.setOrigin(origin);
         }
 
         if (options.method != null or options.url != null or options.query_string != null) {
-            try txn.setRequest(.{
+            try txn_ptr.setRequest(.{
                 .method = options.method,
                 .url = options.url,
                 .query_string = options.query_string,
@@ -96,18 +99,18 @@ pub const RequestContext = struct {
             try hub_ptr.trySetTransaction(options.name);
         }
 
-        hub_ptr.setSpan(.{ .transaction = &txn });
-
-        return .{
+        var context: RequestContext = .{
             .allocator = allocator,
             .hub = hub_ptr,
             .previous_hub = previous_hub,
-            .txn = txn,
+            .txn = txn_ptr,
             .request_method = options.method,
             .request_url = options.url,
             .add_breadcrumb_on_finish = options.add_breadcrumb_on_finish,
             .breadcrumb_category = options.breadcrumb_category,
         };
+        context.hub.setSpan(.{ .transaction = context.txn });
+        return context;
     }
 
     /// Same as `begin`, but source propagation headers are extracted from raw
@@ -171,7 +174,7 @@ pub const RequestContext = struct {
             );
         }
 
-        self.hub.finishTransaction(&self.txn);
+        self.hub.finishTransaction(self.txn);
         self.hub.setSpan(null);
         self.finished = true;
     }
@@ -201,6 +204,7 @@ pub const RequestContext = struct {
         }
 
         self.txn.deinit();
+        self.allocator.destroy(self.txn);
         self.hub.deinit();
         self.allocator.destroy(self.hub);
     }
@@ -324,7 +328,8 @@ pub const OutgoingRequestContext = struct {
     }
 
     pub fn baggageHeaderAlloc(self: *OutgoingRequestContext, allocator: std.mem.Allocator) ![]u8 {
-        return self.hub.baggageHeader(self.span.owner, allocator);
+        const owner = self.resolveOwnerTransaction() orelse return error.NoOwningTransaction;
+        return self.hub.baggageHeader(owner, allocator);
     }
 
     pub fn propagationHeadersAlloc(self: *OutgoingRequestContext, allocator: std.mem.Allocator) !PropagationHeaders {
@@ -379,7 +384,7 @@ pub const OutgoingRequestContext = struct {
         self: *OutgoingRequestContext,
         allocator: std.mem.Allocator,
     ) !PropagationHeaderListWithTraceParent {
-        const owned = try self.propagationHeadersAlloc(allocator);
+        var owned = try self.propagationHeadersAlloc(allocator);
         errdefer owned.deinit(allocator);
 
         const traceparent = try self.traceParentHeaderAlloc(allocator);
@@ -457,6 +462,14 @@ pub const OutgoingRequestContext = struct {
         return switch (current) {
             .span => |value| value == self.span,
             .transaction => false,
+        };
+    }
+
+    fn resolveOwnerTransaction(self: *const OutgoingRequestContext) ?*const Transaction {
+        if (self.span.owner) |owner| return owner;
+        return switch (self.previous_span) {
+            .transaction => |txn| txn,
+            .span => |parent_span| parent_span.owner,
         };
     }
 };
@@ -681,19 +694,17 @@ pub fn runOutgoingRequest(
 }
 
 pub fn spanStatusFromHttpStatus(status_code: u16) SpanStatus {
-    return switch (status_code) {
-        401 => .unauthenticated,
-        403 => .permission_denied,
-        404 => .not_found,
-        409 => .already_exists,
-        429 => .resource_exhausted,
-        501 => .unimplemented,
-        503 => .unavailable,
-        500...599 => .internal_error,
-        400...499 => .invalid_argument,
-        200...399 => .ok,
-        else => .unknown,
-    };
+    if (status_code == 401) return .unauthenticated;
+    if (status_code == 403) return .permission_denied;
+    if (status_code == 404) return .not_found;
+    if (status_code == 409) return .already_exists;
+    if (status_code == 429) return .resource_exhausted;
+    if (status_code == 501) return .unimplemented;
+    if (status_code == 503) return .unavailable;
+    if (status_code >= 500 and status_code <= 599) return .internal_error;
+    if (status_code >= 400 and status_code <= 499) return .invalid_argument;
+    if (status_code >= 200 and status_code <= 399) return .ok;
+    return .unknown;
 }
 
 test "spanStatusFromHttpStatus follows server mapping semantics" {

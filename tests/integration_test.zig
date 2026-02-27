@@ -30,6 +30,50 @@ fn rewriteTransactionBeforeSend(txn: *sentry.Transaction) ?*sentry.Transaction {
     return txn;
 }
 
+const IncomingAutoFlowState = struct {
+    outgoing_traceparent_seen: bool = false,
+};
+
+fn outgoingAutoFlowHandler(
+    request_context: *sentry.integrations.http.OutgoingRequestContext,
+    ctx: ?*anyopaque,
+) anyerror!u16 {
+    const state: *IncomingAutoFlowState = @ptrCast(@alignCast(ctx.?));
+    var headers = try request_context.propagationHeaderListWithTraceParentAlloc(testing.allocator);
+    defer headers.deinit(testing.allocator);
+
+    for (headers.slice()) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "traceparent")) {
+            state.outgoing_traceparent_seen = std.mem.startsWith(u8, header.value, "00-");
+        }
+    }
+
+    request_context.setTag("outbound.auto", "true");
+    return 202;
+}
+
+fn incomingAutoFlowHandler(
+    request_context: *sentry.integrations.http.RequestContext,
+    ctx: ?*anyopaque,
+) anyerror!u16 {
+    const state: *IncomingAutoFlowState = @ptrCast(@alignCast(ctx.?));
+
+    const upstream_status = try sentry.integrations.http.runOutgoingRequest(
+        .{
+            .method = "POST",
+            .url = "https://upstream.example.com/charge",
+            .description = "POST upstream charge",
+        },
+        outgoingAutoFlowHandler,
+        state,
+        .{},
+    );
+    try testing.expectEqual(@as(u16, 202), upstream_status);
+
+    request_context.setTag("incoming.auto", "true");
+    return 207;
+}
+
 const CaptureRelay = struct {
     allocator: std.mem.Allocator,
     server: std.net.Server,
@@ -1738,6 +1782,79 @@ test "CJM e2e: integrations setup callback enriches captured events" {
     try testing.expect(relay.containsInAny("\"type\":\"event\""));
     try testing.expect(relay.containsInAny("\"integration\":\"checkout\""));
     try testing.expect(relay.containsInAny("\"category\":\"integration\""));
+}
+
+test "CJM e2e: auto initWithDefaults captures event with minimal setup" {
+    var relay = try CaptureRelay.init(testing.allocator, &.{});
+    defer relay.deinit();
+    try relay.start();
+
+    const local_dsn = try makeLocalDsn(testing.allocator, relay.port());
+    defer testing.allocator.free(local_dsn);
+
+    const client = try sentry.integrations.auto.initWithDefaults(testing.allocator, .{
+        .dsn = local_dsn,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    client.captureMessage("auto-defaults-event", .info);
+    try testing.expect(client.flush(2000));
+    try testing.expect(relay.waitForAtLeast(1, 2000));
+
+    try testing.expect(relay.containsInAny("\"type\":\"event\""));
+    try testing.expect(relay.containsInAny("auto-defaults-event"));
+}
+
+test "CJM e2e: incoming traceparent auto-flow continues trace and instruments outgoing span" {
+    var relay = try CaptureRelay.init(testing.allocator, &.{});
+    defer relay.deinit();
+    try relay.start();
+
+    const local_dsn = try makeLocalDsn(testing.allocator, relay.port());
+    defer testing.allocator.free(local_dsn);
+
+    const client = try sentry.integrations.auto.initWithDefaults(testing.allocator, .{
+        .dsn = local_dsn,
+        .traces_sample_rate = 1.0,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var flow_state = IncomingAutoFlowState{};
+    const incoming_headers = [_]sentry.PropagationHeader{
+        .{
+            .name = "traceparent",
+            .value = "00-0123456789abcdef0123456789abcdef-89abcdef01234567-01",
+        },
+        .{
+            .name = "baggage",
+            .value = "sentry-trace_id=0123456789abcdef0123456789abcdef,sentry-sampled=true",
+        },
+    };
+
+    const status = try sentry.integrations.http.runIncomingRequestFromHeaders(
+        testing.allocator,
+        client,
+        .{
+            .name = "GET /auto-flow",
+            .method = "GET",
+            .url = "https://api.example.com/auto-flow",
+        },
+        &incoming_headers,
+        incomingAutoFlowHandler,
+        &flow_state,
+        .{},
+    );
+    try testing.expectEqual(@as(u16, 207), status);
+    try testing.expect(flow_state.outgoing_traceparent_seen);
+
+    try testing.expect(client.flush(2000));
+    try testing.expect(relay.waitForAtLeast(1, 2000));
+
+    try testing.expect(relay.containsInAny("\"type\":\"transaction\""));
+    try testing.expect(relay.containsInAny("\"op\":\"http.client\""));
+    try testing.expect(relay.containsInAny("0123456789abcdef0123456789abcdef"));
 }
 
 // ─── 9. Timestamp Formatting ────────────────────────────────────────────────
