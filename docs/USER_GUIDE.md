@@ -207,6 +207,21 @@ Error path:
 _ = req_ctx.fail(error.DatabaseTimeout, 500);
 ```
 
+### Error-return integration helper
+
+Capture returned errors from error-union functions without changing control flow:
+
+```zig
+const result = try sentry.integrations.errors.runAndCapture(doWork, .{input});
+```
+
+Direct wrapper variants:
+
+```zig
+try sentry.integrations.errors.captureResult(doWork(input));
+try sentry.integrations.errors.captureResultAs(doWork(input), "DomainFailure");
+```
+
 ## Client Lifecycle
 
 `Client` manages:

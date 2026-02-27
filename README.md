@@ -148,7 +148,7 @@ jobs:
 | Signal crash marker flow | Implemented | POSIX marker write/read cycle |
 | Hub/TLS scope stack | Implemented | Push/pop scopes + TLS current hub helpers |
 | Structured logs pipeline | Implemented | `log` envelope items + `captureLogMessage` API |
-| Auto integration helpers | Implemented | Global init guard + std.log/panic/http helper integrations |
+| Auto integration helpers | Implemented | Global init guard + std.log/panic/http/error helper integrations |
 | Extended integrations | Roadmap | Additional framework/runtime integrations will be added incrementally |
 
 ## Common Usage
@@ -310,6 +310,11 @@ defer req_ctx.deinit();
 req_ctx.setTag("route", "orders.show");
 req_ctx.setStatusCode(200);
 req_ctx.finish(null);
+```
+
+```zig
+// Error-return helper: captures returned errors automatically
+const value = try sentry.integrations.errors.runAndCapture(doWork, .{input});
 ```
 
 ## Configuration

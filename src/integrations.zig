@@ -6,3 +6,4 @@
 pub const log = @import("integrations/log.zig");
 pub const panic = @import("integrations/panic.zig");
 pub const http = @import("integrations/http.zig");
+pub const errors = @import("integrations/errors.zig");
