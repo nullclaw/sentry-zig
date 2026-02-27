@@ -58,6 +58,12 @@ pub fn main() !void {
 - Versioning follows SemVer tags (`vMAJOR.MINOR.PATCH`).
 - For deterministic production builds, pin exact release tags.
 
+Version enforcement points:
+
+- `build.zig.zon`: `.minimum_zig_version = "0.15.2"`
+- `build.zig`: compile-time guard for `< 0.15.2`
+- `src/sentry.zig`: module compile-time guard for `< 0.15.2`
+
 ## Build and Delivery Model
 
 Sentry-Zig is distributed as source and integrated directly into your Zig build.
@@ -113,6 +119,7 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
+      - run: test "$(zig version)" = "0.15.2"
       - run: zig fmt --check .
       - run: zig build test
       - run: zig build test-integration

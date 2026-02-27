@@ -1,4 +1,16 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
+comptime {
+    const minimum = std.SemanticVersion{
+        .major = 0,
+        .minor = 15,
+        .patch = 2,
+    };
+    if (builtin.zig_version.order(minimum) == .lt) {
+        @compileError("sentry-zig build requires Zig >= 0.15.2");
+    }
+}
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});

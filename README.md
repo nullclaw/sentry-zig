@@ -39,6 +39,12 @@ pub fn main() !void {
 
 - Zig `>= 0.15.2`
 
+Version enforcement is explicit in three places:
+
+- `build.zig.zon`: `.minimum_zig_version = "0.15.2"`
+- `build.zig`: compile-time guard (`@compileError`) for `< 0.15.2`
+- `src/sentry.zig`: module-level compile-time guard (`@compileError`) for `< 0.15.2`
+
 ## Installation
 
 Add dependency:
@@ -96,6 +102,7 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
+      - run: test "$(zig version)" = "0.15.2"
       - run: zig build test
       - run: zig build test-integration
 ```
