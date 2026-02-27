@@ -606,6 +606,94 @@ test "runIncomingRequestFromHeadersWithCurrentHub continues trace from extracted
     try testing.expect(saw_trace);
 }
 
+test "runIncomingRequestFromHeadersWithCurrentHubTyped uses typed handler context" {
+    var payload_state = PayloadState{ .allocator = testing.allocator };
+    defer payload_state.deinit();
+
+    const client = try initWithDefaults(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .transport = .{
+            .send_fn = payloadSendFn,
+            .ctx = &payload_state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var hub = try Hub.init(testing.allocator, client);
+    defer hub.deinit();
+
+    _ = Hub.setCurrent(&hub);
+    defer _ = Hub.clearCurrent();
+
+    const headers = [_]PropagationHeader{
+        .{
+            .name = "traceparent",
+            .value = "00-fedcba9876543210fedcba9876543210-0123456789abcdef-01",
+        },
+    };
+
+    var state = IncomingTypedState{};
+    const status_code = try runIncomingRequestFromHeadersWithCurrentHubTyped(
+        testing.allocator,
+        .{
+            .name = "GET /auto/headers-typed",
+            .method = "GET",
+            .url = "https://api.example.com/auto/headers-typed",
+        },
+        &headers,
+        incomingTypedCurrentHubHandler,
+        &state,
+        .{},
+    );
+    try testing.expectEqual(@as(u16, 205), status_code);
+    try testing.expect(state.saw_handler);
+
+    try testing.expect(client.flush(1000));
+
+    var saw_trace = false;
+    var saw_typed_tag = false;
+    for (payload_state.payloads.items) |payload| {
+        if (std.mem.indexOf(u8, payload, "\"type\":\"transaction\"") == null) continue;
+        if (std.mem.indexOf(u8, payload, "\"trace_id\":\"fedcba9876543210fedcba9876543210\"") != null) {
+            saw_trace = true;
+        }
+        if (std.mem.indexOf(u8, payload, "\"handler\":\"auto-incoming-typed\"") != null) {
+            saw_typed_tag = true;
+        }
+    }
+    try testing.expect(saw_trace);
+    try testing.expect(saw_typed_tag);
+}
+
+test "runIncomingRequestFromHeadersWithCurrentHubTyped requires current hub" {
+    _ = Hub.clearCurrent();
+    try testing.expect(Hub.current() == null);
+
+    const headers = [_]PropagationHeader{
+        .{
+            .name = "traceparent",
+            .value = "00-fedcba9876543210fedcba9876543210-0123456789abcdef-01",
+        },
+    };
+
+    var state = IncomingTypedState{};
+    try testing.expectError(
+        error.NoCurrentHub,
+        runIncomingRequestFromHeadersWithCurrentHubTyped(
+            testing.allocator,
+            .{
+                .name = "GET /auto/no-hub-typed",
+            },
+            &headers,
+            incomingTypedCurrentHubHandler,
+            &state,
+            .{},
+        ),
+    );
+}
+
 test "runOutgoingRequestWithCurrentHubTyped uses typed handler context" {
     var payload_state = PayloadState{ .allocator = testing.allocator };
     defer payload_state.deinit();
