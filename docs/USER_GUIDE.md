@@ -255,6 +255,29 @@ const status = try sentry.integrations.http.runIncomingRequest(
 _ = status;
 ```
 
+Header-driven variant:
+
+```zig
+const headers = [_]sentry.PropagationHeader{
+    .{ .name = "sentry-trace", .value = incoming_sentry_trace },
+    .{ .name = "baggage", .value = incoming_baggage },
+};
+const status = try sentry.integrations.http.runIncomingRequestFromHeaders(
+    allocator,
+    client,
+    .{
+        .name = "GET /orders/:id",
+        .method = "GET",
+        .url = "https://api.example.com/orders/42",
+    },
+    &headers,
+    incomingHandler,
+    handler_ctx,
+    .{},
+);
+_ = status;
+```
+
 ### Outgoing HTTP request integration helper
 
 Use `integrations.http.OutgoingRequestContext` inside an active transaction/span
@@ -271,6 +294,10 @@ defer out.deinit();
 var headers = try out.propagationHeadersAlloc(allocator);
 defer headers.deinit(allocator);
 // Add headers.sentry_trace and headers.baggage to outgoing request headers.
+
+var header_list = try out.propagationHeaderListAlloc(allocator);
+defer header_list.deinit(allocator);
+// header_list.slice() returns []sentry.PropagationHeader.
 
 out.setStatusCode(200);
 out.finish(null);

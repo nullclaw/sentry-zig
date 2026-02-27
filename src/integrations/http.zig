@@ -8,6 +8,7 @@ const Transaction = @import("../transaction.zig").Transaction;
 const TransactionOpts = @import("../transaction.zig").TransactionOpts;
 const TransactionOrSpan = @import("../transaction.zig").TransactionOrSpan;
 const SpanStatus = @import("../transaction.zig").SpanStatus;
+const PropagationHeader = @import("../propagation.zig").PropagationHeader;
 const SendOutcome = @import("../worker.zig").SendOutcome;
 
 pub const RequestOptions = struct {
@@ -97,6 +98,25 @@ pub const RequestContext = struct {
         };
     }
 
+    /// Same as `begin`, but source propagation headers are extracted from raw
+    /// incoming header pairs. Explicit header values in `options` have priority.
+    pub fn beginFromHeaders(
+        allocator: std.mem.Allocator,
+        client: *Client,
+        options: RequestOptions,
+        headers: []const PropagationHeader,
+    ) !RequestContext {
+        var merged_options = options;
+        const extracted = extractIncomingPropagationHeaders(headers);
+        if (merged_options.sentry_trace_header == null) {
+            merged_options.sentry_trace_header = extracted.sentry_trace_header;
+        }
+        if (merged_options.baggage_header == null) {
+            merged_options.baggage_header = extracted.baggage_header;
+        }
+        return begin(allocator, client, merged_options);
+    }
+
     pub fn setTag(self: *RequestContext, key: []const u8, value: []const u8) void {
         self.hub.setTag(key, value);
     }
@@ -176,6 +196,20 @@ pub const PropagationHeaders = struct {
     }
 };
 
+pub const PropagationHeaderList = struct {
+    headers: [2]PropagationHeader,
+    owned: PropagationHeaders,
+
+    pub fn deinit(self: *PropagationHeaderList, allocator: std.mem.Allocator) void {
+        self.owned.deinit(allocator);
+        self.* = undefined;
+    }
+
+    pub fn slice(self: *const PropagationHeaderList) []const PropagationHeader {
+        return self.headers[0..];
+    }
+};
+
 /// Outbound request instrumentation context.
 ///
 /// Requires an active current Hub with a bound transaction/span. `begin` creates
@@ -249,6 +283,28 @@ pub const OutgoingRequestContext = struct {
         };
     }
 
+    /// Build standard outgoing `sentry-trace` and `baggage` headers in a form
+    /// that can be passed directly to APIs using `[]PropagationHeader`.
+    pub fn propagationHeaderListAlloc(
+        self: *OutgoingRequestContext,
+        allocator: std.mem.Allocator,
+    ) !PropagationHeaderList {
+        const owned = try self.propagationHeadersAlloc(allocator);
+        return .{
+            .headers = .{
+                .{
+                    .name = "sentry-trace",
+                    .value = owned.sentry_trace,
+                },
+                .{
+                    .name = "baggage",
+                    .value = owned.baggage,
+                },
+            },
+            .owned = owned,
+        };
+    }
+
     pub fn finish(self: *OutgoingRequestContext, status_code_override: ?u16) void {
         if (self.finished) return;
 
@@ -304,6 +360,28 @@ pub const IncomingRunOptions = struct {
     capture_errors: bool = true,
 };
 
+pub const IncomingPropagationHeaders = struct {
+    sentry_trace_header: ?[]const u8 = null,
+    baggage_header: ?[]const u8 = null,
+};
+
+/// Extract `sentry-trace` and `baggage` values from case-insensitive header
+/// list representation.
+pub fn extractIncomingPropagationHeaders(headers: []const PropagationHeader) IncomingPropagationHeaders {
+    var result: IncomingPropagationHeaders = .{};
+    for (headers) |header| {
+        const name = std.mem.trim(u8, header.name, " \t");
+        if (result.sentry_trace_header == null and std.ascii.eqlIgnoreCase(name, "sentry-trace")) {
+            result.sentry_trace_header = header.value;
+            continue;
+        }
+        if (result.baggage_header == null and std.ascii.eqlIgnoreCase(name, "baggage")) {
+            result.baggage_header = header.value;
+        }
+    }
+    return result;
+}
+
 /// Run an incoming HTTP handler inside `RequestContext` lifecycle.
 ///
 /// The handler returns response status code. On success the transaction is
@@ -318,6 +396,33 @@ pub fn runIncomingRequest(
     run_options: IncomingRunOptions,
 ) anyerror!u16 {
     var request_context = try RequestContext.begin(allocator, client, request_options);
+    defer request_context.deinit();
+
+    const status_code = handler(&request_context, handler_ctx) catch |err| {
+        if (run_options.capture_errors) {
+            _ = request_context.fail(err, run_options.error_status_code);
+        } else {
+            request_context.finish(run_options.error_status_code);
+        }
+        return err;
+    };
+
+    request_context.finish(status_code);
+    return status_code;
+}
+
+/// Same as `runIncomingRequest`, with propagation headers auto-extracted from
+/// raw header list.
+pub fn runIncomingRequestFromHeaders(
+    allocator: std.mem.Allocator,
+    client: *Client,
+    request_options: RequestOptions,
+    headers: []const PropagationHeader,
+    handler: IncomingHandlerFn,
+    handler_ctx: ?*anyopaque,
+    run_options: IncomingRunOptions,
+) anyerror!u16 {
+    var request_context = try RequestContext.beginFromHeaders(allocator, client, request_options, headers);
     defer request_context.deinit();
 
     const status_code = handler(&request_context, handler_ctx) catch |err| {
@@ -563,6 +668,43 @@ test "OutgoingRequestContext creates child span with propagation headers and res
     try testing.expect(saw_transaction);
 }
 
+test "OutgoingRequestContext propagationHeaderListAlloc returns standard header pairs" {
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var hub = try Hub.init(testing.allocator, client);
+    defer hub.deinit();
+    _ = Hub.setCurrent(&hub);
+    defer _ = Hub.clearCurrent();
+
+    var txn = hub.startTransaction(.{
+        .name = "GET /headers",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+    hub.setSpan(.{ .transaction = &txn });
+
+    var out = try OutgoingRequestContext.begin(.{
+        .method = "GET",
+        .url = "https://downstream.example.com/health",
+    });
+    defer out.deinit();
+
+    var list = try out.propagationHeaderListAlloc(testing.allocator);
+    defer list.deinit(testing.allocator);
+
+    const headers = list.slice();
+    try testing.expectEqual(@as(usize, 2), headers.len);
+    try testing.expectEqualStrings("sentry-trace", headers[0].name);
+    try testing.expectEqualStrings("baggage", headers[1].name);
+    try testing.expect(std.mem.indexOf(u8, headers[0].value, txn.trace_id[0..]) != null);
+    try testing.expect(std.mem.indexOf(u8, headers[1].value, "sentry-trace_id=") != null);
+}
+
 test "OutgoingRequestContext fail captures error and defaults HTTP status to 500" {
     var payload_state = PayloadState{ .allocator = testing.allocator };
     defer payload_state.deinit();
@@ -723,6 +865,75 @@ test "runIncomingRequest auto-finishes transaction and captures handler data" {
         }
     }
     try testing.expect(saw_transaction);
+}
+
+test "extractIncomingPropagationHeaders reads case-insensitive sentry headers" {
+    const headers = [_]PropagationHeader{
+        .{
+            .name = "Sentry-Trace",
+            .value = "0123456789abcdef0123456789abcdef-89abcdef01234567-1",
+        },
+        .{
+            .name = "BAGGAGE",
+            .value = "sentry-trace_id=0123456789abcdef0123456789abcdef,sentry-sampled=true",
+        },
+    };
+
+    const extracted = extractIncomingPropagationHeaders(&headers);
+    try testing.expect(extracted.sentry_trace_header != null);
+    try testing.expect(extracted.baggage_header != null);
+    try testing.expectEqualStrings(
+        "0123456789abcdef0123456789abcdef-89abcdef01234567-1",
+        extracted.sentry_trace_header.?,
+    );
+    try testing.expect(std.mem.indexOf(u8, extracted.baggage_header.?, "sentry-trace_id=") != null);
+}
+
+test "runIncomingRequestFromHeaders continues trace using extracted sentry-trace header" {
+    var payload_state = PayloadState{ .allocator = testing.allocator };
+    defer payload_state.deinit();
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .transport = .{
+            .send_fn = payloadSendFn,
+            .ctx = &payload_state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    const headers = [_]PropagationHeader{
+        .{
+            .name = "sentry-trace",
+            .value = "fedcba9876543210fedcba9876543210-0123456789abcdef-1",
+        },
+        .{
+            .name = "baggage",
+            .value = "sentry-trace_id=fedcba9876543210fedcba9876543210,sentry-sampled=true",
+        },
+    };
+
+    var state = IncomingHandlerSuccessState{};
+    const status_code = try runIncomingRequestFromHeaders(
+        testing.allocator,
+        client,
+        .{
+            .name = "GET /pipeline-headers",
+            .method = "GET",
+            .url = "https://api.example.com/pipeline-headers",
+        },
+        &headers,
+        incomingHandlerSuccess,
+        &state,
+        .{},
+    );
+    try testing.expectEqual(@as(u16, 204), status_code);
+
+    try testing.expect(client.flush(1000));
+    try testing.expect(payload_state.payloads.items.len >= 1);
+    try testing.expect(std.mem.indexOf(u8, payload_state.payloads.items[0], "fedcba9876543210fedcba9876543210") != null);
 }
 
 test "runIncomingRequest captures handler errors and marks transaction as internal_error" {

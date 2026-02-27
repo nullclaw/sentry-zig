@@ -349,6 +349,28 @@ _ = status;
 ```
 
 ```zig
+// Variant that extracts sentry-trace/baggage from raw headers automatically
+const incoming_headers = [_]sentry.PropagationHeader{
+    .{ .name = "sentry-trace", .value = incoming_sentry_trace },
+    .{ .name = "baggage", .value = incoming_baggage },
+};
+const status = try sentry.integrations.http.runIncomingRequestFromHeaders(
+    allocator,
+    client,
+    .{
+        .name = "GET /orders/:id",
+        .method = "GET",
+        .url = "https://api.example.com/orders/42",
+    },
+    &incoming_headers,
+    incomingHandler,
+    handler_ctx,
+    .{},
+);
+_ = status;
+```
+
+```zig
 // Downstream HTTP helper: child span + propagation headers + status mapping
 var out = try sentry.integrations.http.OutgoingRequestContext.begin(.{
     .method = "POST",
@@ -360,6 +382,10 @@ defer out.deinit();
 var headers = try out.propagationHeadersAlloc(allocator);
 defer headers.deinit(allocator);
 // Attach headers.sentry_trace and headers.baggage to your outgoing HTTP request.
+
+var header_list = try out.propagationHeaderListAlloc(allocator);
+defer header_list.deinit(allocator);
+// Or use header_list.slice() where []sentry.PropagationHeader is accepted.
 
 out.setStatusCode(200);
 out.finish(null);
