@@ -297,6 +297,15 @@ sentry.integrations.log.install(.{
 ```
 
 ```zig
+// One-line built-in setup preset for Options.integrations
+const client = try sentry.init(allocator, .{
+    .dsn = "https://PUBLIC_KEY@o0.ingest.sentry.io/PROJECT_ID",
+    .integrations = sentry.integrations.auto.defaults(),
+});
+defer client.deinit();
+```
+
+```zig
 // HTTP request helper: starts/continues trace, binds per-request hub, maps status
 var req_ctx = try sentry.integrations.http.RequestContext.begin(allocator, client, .{
     .name = "GET /orders/:id",
@@ -340,6 +349,17 @@ var detached = try sentry.integrations.runtime.DetachedHub.fromCurrent(allocator
 defer detached.deinit();
 
 try detached.run(workerEntry, .{&detached});
+```
+
+```zig
+// Thread helper: spawn worker with inherited Hub context automatically
+const worker = try sentry.integrations.runtime.spawnWithCurrentHub(
+    allocator,
+    .{},
+    workerEntry,
+    .{arg1, arg2},
+);
+worker.join();
 ```
 
 ## Configuration

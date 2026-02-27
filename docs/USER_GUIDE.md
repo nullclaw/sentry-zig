@@ -163,6 +163,16 @@ sentry.integrations.log.install(.{
 });
 ```
 
+You can also attach built-in setup callbacks directly via `Options.integrations`:
+
+```zig
+const client = try sentry.init(allocator, .{
+    .dsn = "https://PUBLIC_KEY@o0.ingest.sentry.io/PROJECT_ID",
+    .integrations = sentry.integrations.auto.defaults(),
+});
+defer client.deinit();
+```
+
 ### panic integration helper
 
 Forward panics to Sentry before Zig default panic handling:
@@ -259,6 +269,31 @@ var detached = try sentry.integrations.runtime.DetachedHub.fromCurrent(allocator
 defer detached.deinit();
 
 const result = try detached.run(workerStep, .{input});
+```
+
+For thread-based workers, use spawn helpers:
+
+```zig
+const worker = try sentry.integrations.runtime.spawnWithCurrentHub(
+    allocator,
+    .{},
+    workerStep,
+    .{input},
+);
+worker.join();
+```
+
+If you need to spawn from an explicit source Hub (without a TLS current Hub):
+
+```zig
+const worker = try sentry.integrations.runtime.spawnFromHub(
+    allocator,
+    source_hub,
+    .{},
+    workerStep,
+    .{input},
+);
+worker.join();
 ```
 
 ## Client Lifecycle
