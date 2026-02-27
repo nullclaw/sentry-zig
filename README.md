@@ -148,7 +148,7 @@ jobs:
 | Signal crash marker flow | Implemented | POSIX marker write/read cycle |
 | Hub/TLS scope stack | Implemented | Push/pop scopes + TLS current hub helpers |
 | Structured logs pipeline | Implemented | `log` envelope items + `captureLogMessage` API |
-| Auto integration helpers | Implemented | Global init guard + std.log/panic helper integrations |
+| Auto integration helpers | Implemented | Global init guard + std.log/panic/http helper integrations |
 | Extended integrations | Roadmap | Additional framework/runtime integrations will be added incrementally |
 
 ## Common Usage
@@ -294,6 +294,22 @@ sentry.integrations.log.install(.{
     .min_level = .info,
     .forward_to_default_logger = true,
 });
+```
+
+```zig
+// HTTP request helper: starts/continues trace, binds per-request hub, maps status
+var req_ctx = try sentry.integrations.http.RequestContext.begin(allocator, client, .{
+    .name = "GET /orders/:id",
+    .method = "GET",
+    .url = "https://api.example.com/orders/42",
+    .sentry_trace_header = incoming_sentry_trace,
+    .baggage_header = incoming_baggage,
+});
+defer req_ctx.deinit();
+
+req_ctx.setTag("route", "orders.show");
+req_ctx.setStatusCode(200);
+req_ctx.finish(null);
 ```
 
 ## Configuration

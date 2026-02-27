@@ -180,6 +180,33 @@ sentry.integrations.panic.install(.{
 });
 ```
 
+### HTTP request integration helper
+
+Use `integrations.http.RequestContext` to get middleware-style request
+instrumentation with automatic per-request Hub isolation.
+
+```zig
+var req_ctx = try sentry.integrations.http.RequestContext.begin(allocator, client, .{
+    .name = "GET /orders/:id",
+    .method = "GET",
+    .url = "https://api.example.com/orders/42",
+    .query_string = "expand=items",
+    .sentry_trace_header = incoming_sentry_trace,
+    .baggage_header = incoming_baggage,
+});
+defer req_ctx.deinit();
+
+req_ctx.setTag("route", "orders.show");
+req_ctx.setStatusCode(200);
+req_ctx.finish(null);
+```
+
+Error path:
+
+```zig
+_ = req_ctx.fail(error.DatabaseTimeout, 500);
+```
+
 ## Client Lifecycle
 
 `Client` manages:
