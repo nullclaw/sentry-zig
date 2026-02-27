@@ -5,6 +5,7 @@ const Client = @import("../client.zig").Client;
 const Integration = @import("../client.zig").Integration;
 const Options = @import("../client.zig").Options;
 const Hub = @import("../hub.zig").Hub;
+const PropagationHeader = @import("../propagation.zig").PropagationHeader;
 const SendOutcome = @import("../worker.zig").SendOutcome;
 const http = @import("http.zig");
 const log = @import("log.zig");
@@ -167,7 +168,7 @@ pub fn runIncomingRequestWithCurrentHub(
 pub fn runIncomingRequestFromHeadersWithCurrentHub(
     allocator: std.mem.Allocator,
     request_options: http.RequestOptions,
-    headers: []const @import("../propagation.zig").PropagationHeader,
+    headers: []const PropagationHeader,
     handler: http.IncomingHandlerFn,
     handler_ctx: ?*anyopaque,
     run_options: http.IncomingRunOptions,
@@ -193,6 +194,57 @@ pub fn runOutgoingRequestWithCurrentHub(
 ) anyerror!u16 {
     if (Hub.current() == null) return error.NoCurrentHub;
     return http.runOutgoingRequest(request_options, handler, handler_ctx, run_options);
+}
+
+/// Typed variant of `runIncomingRequestWithCurrentHub`.
+pub fn runIncomingRequestWithCurrentHubTyped(
+    allocator: std.mem.Allocator,
+    request_options: http.RequestOptions,
+    comptime handler: anytype,
+    handler_ctx: anytype,
+    run_options: http.IncomingRunOptions,
+) anyerror!u16 {
+    const hub = Hub.current() orelse return error.NoCurrentHub;
+    return http.runIncomingRequestTyped(
+        allocator,
+        hub.clientPtr(),
+        request_options,
+        handler,
+        handler_ctx,
+        run_options,
+    );
+}
+
+/// Typed variant of `runIncomingRequestFromHeadersWithCurrentHub`.
+pub fn runIncomingRequestFromHeadersWithCurrentHubTyped(
+    allocator: std.mem.Allocator,
+    request_options: http.RequestOptions,
+    headers: []const PropagationHeader,
+    comptime handler: anytype,
+    handler_ctx: anytype,
+    run_options: http.IncomingRunOptions,
+) anyerror!u16 {
+    const hub = Hub.current() orelse return error.NoCurrentHub;
+    return http.runIncomingRequestFromHeadersTyped(
+        allocator,
+        hub.clientPtr(),
+        request_options,
+        headers,
+        handler,
+        handler_ctx,
+        run_options,
+    );
+}
+
+/// Typed variant of `runOutgoingRequestWithCurrentHub`.
+pub fn runOutgoingRequestWithCurrentHubTyped(
+    request_options: http.OutgoingRequestOptions,
+    comptime handler: anytype,
+    handler_ctx: anytype,
+    run_options: http.OutgoingRunOptions,
+) anyerror!u16 {
+    if (Hub.current() == null) return error.NoCurrentHub;
+    return http.runOutgoingRequestTyped(request_options, handler, handler_ctx, run_options);
 }
 
 var lookup_called: bool = false;
@@ -232,6 +284,36 @@ fn incomingOkHandler(_: *http.RequestContext, _: ?*anyopaque) anyerror!u16 {
 
 fn outgoingOkHandler(_: *http.OutgoingRequestContext, _: ?*anyopaque) anyerror!u16 {
     return 200;
+}
+
+const IncomingTypedState = struct {
+    saw_handler: bool = false,
+};
+
+fn incomingTypedCurrentHubHandler(
+    context: *http.RequestContext,
+    state: *IncomingTypedState,
+) anyerror!u16 {
+    state.saw_handler = true;
+    context.setTag("handler", "auto-incoming-typed");
+    return 205;
+}
+
+const OutgoingTypedState = struct {
+    saw_headers: bool = false,
+};
+
+fn outgoingTypedCurrentHubHandler(
+    context: *http.OutgoingRequestContext,
+    state: *OutgoingTypedState,
+) anyerror!u16 {
+    var headers = try context.propagationHeadersAlloc(testing.allocator);
+    defer headers.deinit(testing.allocator);
+
+    state.saw_headers = std.mem.indexOf(u8, headers.sentry_trace, "-") != null and
+        std.mem.indexOf(u8, headers.baggage, "sentry-trace_id=") != null;
+    context.setTag("handler", "auto-outgoing-typed");
+    return 208;
 }
 
 test "auto defaults expose log and panic setup callbacks" {
@@ -402,6 +484,54 @@ test "runIncomingRequestWithCurrentHub uses current hub client" {
     try testing.expect(saw_transaction);
 }
 
+test "runIncomingRequestWithCurrentHubTyped uses typed handler context" {
+    var payload_state = PayloadState{ .allocator = testing.allocator };
+    defer payload_state.deinit();
+
+    const client = try initWithDefaults(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .transport = .{
+            .send_fn = payloadSendFn,
+            .ctx = &payload_state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var hub = try Hub.init(testing.allocator, client);
+    defer hub.deinit();
+
+    _ = Hub.setCurrent(&hub);
+    defer _ = Hub.clearCurrent();
+
+    var state = IncomingTypedState{};
+    const status_code = try runIncomingRequestWithCurrentHubTyped(
+        testing.allocator,
+        .{
+            .name = "GET /auto/current-typed",
+            .method = "GET",
+            .url = "https://api.example.com/auto/current-typed",
+        },
+        incomingTypedCurrentHubHandler,
+        &state,
+        .{},
+    );
+    try testing.expectEqual(@as(u16, 205), status_code);
+    try testing.expect(state.saw_handler);
+
+    try testing.expect(client.flush(1000));
+
+    var saw_typed_tag = false;
+    for (payload_state.payloads.items) |payload| {
+        if (std.mem.indexOf(u8, payload, "\"type\":\"transaction\"") == null) continue;
+        if (std.mem.indexOf(u8, payload, "\"handler\":\"auto-incoming-typed\"") != null) {
+            saw_typed_tag = true;
+        }
+    }
+    try testing.expect(saw_typed_tag);
+}
+
 test "runIncomingRequestWithCurrentHub requires current hub" {
     _ = Hub.clearCurrent();
     try testing.expect(Hub.current() == null);
@@ -439,7 +569,7 @@ test "runIncomingRequestFromHeadersWithCurrentHub continues trace from extracted
     _ = Hub.setCurrent(&hub);
     defer _ = Hub.clearCurrent();
 
-    const headers = [_]@import("../propagation.zig").PropagationHeader{
+    const headers = [_]PropagationHeader{
         .{
             .name = "traceparent",
             .value = "00-0123456789abcdef0123456789abcdef-89abcdef01234567-01",
@@ -474,6 +604,62 @@ test "runIncomingRequestFromHeadersWithCurrentHub continues trace from extracted
         }
     }
     try testing.expect(saw_trace);
+}
+
+test "runOutgoingRequestWithCurrentHubTyped uses typed handler context" {
+    var payload_state = PayloadState{ .allocator = testing.allocator };
+    defer payload_state.deinit();
+
+    const client = try initWithDefaults(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .transport = .{
+            .send_fn = payloadSendFn,
+            .ctx = &payload_state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var hub = try Hub.init(testing.allocator, client);
+    defer hub.deinit();
+    _ = Hub.setCurrent(&hub);
+    defer _ = Hub.clearCurrent();
+
+    var txn = hub.startTransaction(.{
+        .name = "GET /auto/outgoing-typed-parent",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+    hub.setSpan(.{ .transaction = &txn });
+
+    var state = OutgoingTypedState{};
+    const status_code = try runOutgoingRequestWithCurrentHubTyped(
+        .{
+            .method = "POST",
+            .url = "https://api.example.com/auto/outgoing-typed",
+            .description = "POST auto outgoing typed",
+        },
+        outgoingTypedCurrentHubHandler,
+        &state,
+        .{},
+    );
+    try testing.expectEqual(@as(u16, 208), status_code);
+    try testing.expect(state.saw_headers);
+
+    hub.finishTransaction(&txn);
+    hub.setSpan(null);
+
+    try testing.expect(client.flush(1000));
+
+    var saw_typed_tag = false;
+    for (payload_state.payloads.items) |payload| {
+        if (std.mem.indexOf(u8, payload, "\"type\":\"transaction\"") == null) continue;
+        if (std.mem.indexOf(u8, payload, "\"handler\":\"auto-outgoing-typed\"") != null) {
+            saw_typed_tag = true;
+        }
+    }
+    try testing.expect(saw_typed_tag);
 }
 
 test "runOutgoingRequestWithCurrentHub requires current hub" {

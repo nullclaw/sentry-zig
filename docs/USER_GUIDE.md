@@ -324,6 +324,30 @@ const status = try sentry.integrations.auto.runIncomingRequestWithCurrentHub(
 _ = status;
 ```
 
+Typed Current TLS Hub variant (compile-time validated handler signature):
+
+```zig
+const IncomingState = struct { handled: bool = false };
+fn incomingTyped(ctx: *sentry.integrations.http.RequestContext, state: *IncomingState) !u16 {
+    state.handled = true;
+    return 204;
+}
+
+var state = IncomingState{};
+const status = try sentry.integrations.auto.runIncomingRequestWithCurrentHubTyped(
+    allocator,
+    .{
+        .name = "GET /orders/:id",
+        .method = "GET",
+        .url = "https://api.example.com/orders/42",
+    },
+    incomingTyped,
+    &state,
+    .{},
+);
+_ = status;
+```
+
 Header-driven variant:
 
 ```zig
@@ -416,6 +440,30 @@ const upstream_status = try sentry.integrations.http.runOutgoingRequest(
     },
     outgoingHandler,
     handler_ctx,
+    .{},
+);
+_ = upstream_status;
+```
+
+Typed outgoing helper variant:
+
+```zig
+const OutState = struct { propagated: bool = false };
+fn outgoingTyped(ctx: *sentry.integrations.http.OutgoingRequestContext, state: *OutState) !u16 {
+    var h = try ctx.propagationHeadersAlloc(allocator);
+    defer h.deinit(allocator);
+    state.propagated = true;
+    return 200;
+}
+
+var out_state = OutState{};
+const upstream_status = try sentry.integrations.auto.runOutgoingRequestWithCurrentHubTyped(
+    .{
+        .method = "POST",
+        .url = "https://payments.example.com/charge",
+    },
+    outgoingTyped,
+    &out_state,
     .{},
 );
 _ = upstream_status;

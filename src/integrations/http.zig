@@ -563,6 +563,84 @@ fn addHttpBreadcrumb(
     hub.addBreadcrumb(crumb);
 }
 
+fn functionInfoFromCallable(comptime Callable: type, comptime api_name: []const u8) std.builtin.Type.Fn {
+    return switch (@typeInfo(Callable)) {
+        .@"fn" => |fn_info| fn_info,
+        .pointer => |ptr| switch (@typeInfo(ptr.child)) {
+            .@"fn" => |fn_info| fn_info,
+            else => @compileError(api_name ++ " expects a function or function pointer"),
+        },
+        else => @compileError(api_name ++ " expects a function or function pointer"),
+    };
+}
+
+fn assertSinglePointerContext(comptime ContextType: type, comptime api_name: []const u8) void {
+    const ptr = switch (@typeInfo(ContextType)) {
+        .pointer => |info| info,
+        else => @compileError(api_name ++ " requires `handler_ctx` to be a single-item pointer"),
+    };
+    if (ptr.size != .one) {
+        @compileError(api_name ++ " requires `handler_ctx` to be a single-item pointer");
+    }
+}
+
+fn assertErrorUnionU16Return(comptime ReturnType: type, comptime api_name: []const u8) void {
+    switch (@typeInfo(ReturnType)) {
+        .error_union => |eu| {
+            if (eu.payload != u16) {
+                @compileError(api_name ++ " requires handler return type `anyerror!u16`");
+            }
+        },
+        else => @compileError(api_name ++ " requires handler return type `anyerror!u16`"),
+    }
+}
+
+fn assertIncomingTypedHandler(comptime HandlerType: type, comptime ContextType: type, comptime api_name: []const u8) void {
+    const fn_info = functionInfoFromCallable(HandlerType, api_name);
+    if (fn_info.params.len != 2) {
+        @compileError(api_name ++ " requires handler signature `fn(*RequestContext, <ctx_ptr>) anyerror!u16`");
+    }
+
+    const request_param = fn_info.params[0].type orelse
+        @compileError(api_name ++ " handler parameters must have concrete types");
+    if (request_param != *RequestContext) {
+        @compileError(api_name ++ " first handler parameter must be `*RequestContext`");
+    }
+
+    const context_param = fn_info.params[1].type orelse
+        @compileError(api_name ++ " handler parameters must have concrete types");
+    if (context_param != ContextType) {
+        @compileError(api_name ++ " second handler parameter must match `handler_ctx` type");
+    }
+
+    const return_type = fn_info.return_type orelse
+        @compileError(api_name ++ " handler must have return type `anyerror!u16`");
+    assertErrorUnionU16Return(return_type, api_name);
+}
+
+fn assertOutgoingTypedHandler(comptime HandlerType: type, comptime ContextType: type, comptime api_name: []const u8) void {
+    const fn_info = functionInfoFromCallable(HandlerType, api_name);
+    if (fn_info.params.len != 2) {
+        @compileError(api_name ++ " requires handler signature `fn(*OutgoingRequestContext, <ctx_ptr>) anyerror!u16`");
+    }
+
+    const request_param = fn_info.params[0].type orelse
+        @compileError(api_name ++ " handler parameters must have concrete types");
+    if (request_param != *OutgoingRequestContext) {
+        @compileError(api_name ++ " first handler parameter must be `*OutgoingRequestContext`");
+    }
+
+    const context_param = fn_info.params[1].type orelse
+        @compileError(api_name ++ " handler parameters must have concrete types");
+    if (context_param != ContextType) {
+        @compileError(api_name ++ " second handler parameter must match `handler_ctx` type");
+    }
+
+    const return_type = fn_info.return_type orelse
+        @compileError(api_name ++ " handler must have return type `anyerror!u16`");
+    assertErrorUnionU16Return(return_type, api_name);
+}
+
 /// Run an incoming HTTP handler inside `RequestContext` lifecycle.
 ///
 /// The handler returns response status code. On success the transaction is
@@ -592,6 +670,41 @@ pub fn runIncomingRequest(
     return status_code;
 }
 
+/// Typed variant of `runIncomingRequest`.
+///
+/// It removes `anyopaque` casts from user code by accepting a strongly-typed
+/// context pointer and compile-time validating handler signature.
+pub fn runIncomingRequestTyped(
+    allocator: std.mem.Allocator,
+    client: *Client,
+    request_options: RequestOptions,
+    comptime handler: anytype,
+    handler_ctx: anytype,
+    run_options: IncomingRunOptions,
+) anyerror!u16 {
+    const ContextType = @TypeOf(handler_ctx);
+    comptime {
+        assertSinglePointerContext(ContextType, "runIncomingRequestTyped");
+        assertIncomingTypedHandler(@TypeOf(handler), ContextType, "runIncomingRequestTyped");
+    }
+
+    const Adapter = struct {
+        fn call(request_context: *RequestContext, ctx: ?*anyopaque) anyerror!u16 {
+            const typed_ctx: ContextType = @ptrCast(@alignCast(ctx.?));
+            return @call(.auto, handler, .{ request_context, typed_ctx });
+        }
+    };
+
+    return runIncomingRequest(
+        allocator,
+        client,
+        request_options,
+        Adapter.call,
+        @ptrCast(@constCast(handler_ctx)),
+        run_options,
+    );
+}
+
 /// Same as `runIncomingRequest`, with propagation headers auto-extracted from
 /// raw header list.
 pub fn runIncomingRequestFromHeaders(
@@ -617,6 +730,40 @@ pub fn runIncomingRequestFromHeaders(
 
     request_context.finish(status_code);
     return status_code;
+}
+
+/// Typed variant of `runIncomingRequestFromHeaders`.
+pub fn runIncomingRequestFromHeadersTyped(
+    allocator: std.mem.Allocator,
+    client: *Client,
+    request_options: RequestOptions,
+    headers: []const PropagationHeader,
+    comptime handler: anytype,
+    handler_ctx: anytype,
+    run_options: IncomingRunOptions,
+) anyerror!u16 {
+    const ContextType = @TypeOf(handler_ctx);
+    comptime {
+        assertSinglePointerContext(ContextType, "runIncomingRequestFromHeadersTyped");
+        assertIncomingTypedHandler(@TypeOf(handler), ContextType, "runIncomingRequestFromHeadersTyped");
+    }
+
+    const Adapter = struct {
+        fn call(request_context: *RequestContext, ctx: ?*anyopaque) anyerror!u16 {
+            const typed_ctx: ContextType = @ptrCast(@alignCast(ctx.?));
+            return @call(.auto, handler, .{ request_context, typed_ctx });
+        }
+    };
+
+    return runIncomingRequestFromHeaders(
+        allocator,
+        client,
+        request_options,
+        headers,
+        Adapter.call,
+        @ptrCast(@constCast(handler_ctx)),
+        run_options,
+    );
 }
 
 pub const OutgoingHandlerFn = *const fn (*OutgoingRequestContext, ?*anyopaque) anyerror!u16;
@@ -651,6 +798,34 @@ pub fn runOutgoingRequest(
 
     request_context.finish(status_code);
     return status_code;
+}
+
+/// Typed variant of `runOutgoingRequest`.
+pub fn runOutgoingRequestTyped(
+    request_options: OutgoingRequestOptions,
+    comptime handler: anytype,
+    handler_ctx: anytype,
+    run_options: OutgoingRunOptions,
+) anyerror!u16 {
+    const ContextType = @TypeOf(handler_ctx);
+    comptime {
+        assertSinglePointerContext(ContextType, "runOutgoingRequestTyped");
+        assertOutgoingTypedHandler(@TypeOf(handler), ContextType, "runOutgoingRequestTyped");
+    }
+
+    const Adapter = struct {
+        fn call(request_context: *OutgoingRequestContext, ctx: ?*anyopaque) anyerror!u16 {
+            const typed_ctx: ContextType = @ptrCast(@alignCast(ctx.?));
+            return @call(.auto, handler, .{ request_context, typed_ctx });
+        }
+    };
+
+    return runOutgoingRequest(
+        request_options,
+        Adapter.call,
+        @ptrCast(@constCast(handler_ctx)),
+        run_options,
+    );
 }
 
 pub fn spanStatusFromHttpStatus(status_code: u16) SpanStatus {
@@ -1050,6 +1225,12 @@ fn incomingHandlerFailure(_: *RequestContext, _: ?*anyopaque) anyerror!u16 {
     return error.IncomingPipelineFailure;
 }
 
+fn incomingTypedHandler(context: *RequestContext, state: *IncomingHandlerSuccessState) anyerror!u16 {
+    state.headers_seen = true;
+    context.setTag("handler", "incoming-typed");
+    return 206;
+}
+
 const OutgoingHandlerSuccessState = struct {
     saw_trace_header: bool = false,
     saw_baggage_header: bool = false,
@@ -1068,6 +1249,16 @@ fn outgoingHandlerSuccess(context: *OutgoingRequestContext, ctx: ?*anyopaque) an
 
 fn outgoingHandlerFailure(_: *OutgoingRequestContext, _: ?*anyopaque) anyerror!u16 {
     return error.OutgoingPipelineFailure;
+}
+
+fn outgoingTypedHandler(context: *OutgoingRequestContext, state: *OutgoingHandlerSuccessState) anyerror!u16 {
+    var headers = try context.propagationHeadersAlloc(testing.allocator);
+    defer headers.deinit(testing.allocator);
+
+    state.saw_trace_header = std.mem.indexOf(u8, headers.sentry_trace, "-") != null;
+    state.saw_baggage_header = std.mem.indexOf(u8, headers.baggage, "sentry-trace_id=") != null;
+    context.setTag("handler", "outgoing-typed");
+    return 207;
 }
 
 test "runIncomingRequest auto-finishes transaction and captures handler data" {
@@ -1111,6 +1302,52 @@ test "runIncomingRequest auto-finishes transaction and captures handler data" {
             try testing.expect(std.mem.indexOf(u8, payload, "\"name\":\"GET /pipeline\"") != null);
             try testing.expect(std.mem.indexOf(u8, payload, "\"status_code\":204") != null);
             try testing.expect(std.mem.indexOf(u8, payload, "\"handler\":\"incoming-success\"") != null);
+        }
+    }
+    try testing.expect(saw_transaction);
+}
+
+test "runIncomingRequestTyped validates typed context and captures handler data" {
+    var payload_state = PayloadState{ .allocator = testing.allocator };
+    defer payload_state.deinit();
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .transport = .{
+            .send_fn = payloadSendFn,
+            .ctx = &payload_state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var state = IncomingHandlerSuccessState{};
+    const status_code = try runIncomingRequestTyped(
+        testing.allocator,
+        client,
+        .{
+            .name = "GET /pipeline-typed",
+            .method = "GET",
+            .url = "https://api.example.com/pipeline-typed",
+        },
+        incomingTypedHandler,
+        &state,
+        .{},
+    );
+    try testing.expectEqual(@as(u16, 206), status_code);
+    try testing.expect(state.headers_seen);
+
+    try testing.expect(client.flush(1000));
+    try testing.expect(payload_state.payloads.items.len >= 1);
+
+    var saw_transaction = false;
+    for (payload_state.payloads.items) |payload| {
+        if (std.mem.indexOf(u8, payload, "\"type\":\"transaction\"") != null) {
+            saw_transaction = true;
+            try testing.expect(std.mem.indexOf(u8, payload, "\"name\":\"GET /pipeline-typed\"") != null);
+            try testing.expect(std.mem.indexOf(u8, payload, "\"status_code\":206") != null);
+            try testing.expect(std.mem.indexOf(u8, payload, "\"handler\":\"incoming-typed\"") != null);
         }
     }
     try testing.expect(saw_transaction);
@@ -1189,6 +1426,50 @@ test "runIncomingRequestFromHeaders continues trace using extracted sentry-trace
     try testing.expect(client.flush(1000));
     try testing.expect(payload_state.payloads.items.len >= 1);
     try testing.expect(std.mem.indexOf(u8, payload_state.payloads.items[0], "fedcba9876543210fedcba9876543210") != null);
+}
+
+test "runIncomingRequestFromHeadersTyped continues trace using typed handler context" {
+    var payload_state = PayloadState{ .allocator = testing.allocator };
+    defer payload_state.deinit();
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .transport = .{
+            .send_fn = payloadSendFn,
+            .ctx = &payload_state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    const headers = [_]PropagationHeader{
+        .{
+            .name = "traceparent",
+            .value = "00-0123456789abcdef0123456789abcdef-89abcdef01234567-01",
+        },
+    };
+
+    var state = IncomingHandlerSuccessState{};
+    const status_code = try runIncomingRequestFromHeadersTyped(
+        testing.allocator,
+        client,
+        .{
+            .name = "GET /typed-headers",
+            .method = "GET",
+            .url = "https://api.example.com/typed-headers",
+        },
+        &headers,
+        incomingTypedHandler,
+        &state,
+        .{},
+    );
+    try testing.expectEqual(@as(u16, 206), status_code);
+    try testing.expect(state.headers_seen);
+
+    try testing.expect(client.flush(1000));
+    try testing.expect(payload_state.payloads.items.len >= 1);
+    try testing.expect(std.mem.indexOf(u8, payload_state.payloads.items[0], "0123456789abcdef0123456789abcdef") != null);
 }
 
 test "runIncomingRequestFromHeaders continues trace from traceparent when sentry-trace is missing" {
@@ -1480,6 +1761,66 @@ test "runOutgoingRequest auto-finishes span and propagates headers" {
             try testing.expect(std.mem.indexOf(u8, payload, "\"description\":\"POST payments charge\"") != null);
             try testing.expect(std.mem.indexOf(u8, payload, "\"status_code\":202") != null);
             try testing.expect(std.mem.indexOf(u8, payload, "\"handler\":\"outgoing-success\"") != null);
+        }
+    }
+    try testing.expect(saw_transaction);
+}
+
+test "runOutgoingRequestTyped auto-finishes span with typed handler context" {
+    var payload_state = PayloadState{ .allocator = testing.allocator };
+    defer payload_state.deinit();
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .transport = .{
+            .send_fn = payloadSendFn,
+            .ctx = &payload_state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var hub = try Hub.init(testing.allocator, client);
+    defer hub.deinit();
+    _ = Hub.setCurrent(&hub);
+    defer _ = Hub.clearCurrent();
+
+    var txn = hub.startTransaction(.{
+        .name = "POST /checkout-typed",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+    hub.setSpan(.{ .transaction = &txn });
+
+    var state = OutgoingHandlerSuccessState{};
+    const status_code = try runOutgoingRequestTyped(
+        .{
+            .method = "POST",
+            .url = "https://payments.example.com/v1/charge-typed",
+            .description = "POST payments charge typed",
+        },
+        outgoingTypedHandler,
+        &state,
+        .{},
+    );
+    try testing.expectEqual(@as(u16, 207), status_code);
+    try testing.expect(state.saw_trace_header);
+    try testing.expect(state.saw_baggage_header);
+
+    hub.finishTransaction(&txn);
+    hub.setSpan(null);
+
+    try testing.expect(client.flush(1000));
+    try testing.expect(payload_state.payloads.items.len >= 1);
+
+    var saw_transaction = false;
+    for (payload_state.payloads.items) |payload| {
+        if (std.mem.indexOf(u8, payload, "\"type\":\"transaction\"") != null) {
+            saw_transaction = true;
+            try testing.expect(std.mem.indexOf(u8, payload, "\"description\":\"POST payments charge typed\"") != null);
+            try testing.expect(std.mem.indexOf(u8, payload, "\"status_code\":207") != null);
+            try testing.expect(std.mem.indexOf(u8, payload, "\"handler\":\"outgoing-typed\"") != null);
         }
     }
     try testing.expect(saw_transaction);

@@ -411,6 +411,25 @@ _ = status;
 ```
 
 ```zig
+// Typed variant: no anyopaque in your handler, signature validated at compile time
+const IncomingState = struct { handled: bool = false };
+fn incomingTyped(ctx: *sentry.integrations.http.RequestContext, state: *IncomingState) !u16 {
+    state.handled = true;
+    return 204;
+}
+
+var state = IncomingState{};
+const status = try sentry.integrations.auto.runIncomingRequestWithCurrentHubTyped(
+    allocator,
+    .{ .name = "GET /orders/:id", .method = "GET" },
+    incomingTyped,
+    &state,
+    .{},
+);
+_ = status;
+```
+
+```zig
 // Variant that extracts sentry-trace/baggage from raw headers automatically
 const incoming_headers = [_]sentry.PropagationHeader{
     .{ .name = "sentry-trace", .value = incoming_sentry_trace },
@@ -474,6 +493,26 @@ defer header_list_w3c.deinit(allocator);
 out.setStatusCode(200);
 out.finish(null);
 // HTTP breadcrumb is added automatically on finish by default.
+```
+
+```zig
+// Typed outgoing helper variant
+const OutState = struct { propagated: bool = false };
+fn outgoingTyped(ctx: *sentry.integrations.http.OutgoingRequestContext, state: *OutState) !u16 {
+    var h = try ctx.propagationHeadersAlloc(allocator);
+    defer h.deinit(allocator);
+    state.propagated = true;
+    return 200;
+}
+
+var out_state = OutState{};
+const code = try sentry.integrations.auto.runOutgoingRequestWithCurrentHubTyped(
+    .{ .method = "POST", .url = "https://payments.example.com/charge" },
+    outgoingTyped,
+    &out_state,
+    .{},
+);
+_ = code;
 ```
 
 ```zig
