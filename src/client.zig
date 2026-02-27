@@ -466,19 +466,19 @@ pub const Client = struct {
             }
         }
 
-        // Update session based on the prepared event before applying sampling.
+        var should_try_send_application_session_update = false;
+
+        // Update session counters before sampling, but defer session update submission
+        // until the event is accepted.
         {
             self.mutex.lock();
             defer self.mutex.unlock();
             if (self.session) |*s| {
-                if (prepared_event.level) |level| {
-                    if (level == .err or level == .fatal) {
-                        s.markErrored();
-                    }
+                if (eventIncrementsSessionErrors(prepared_event)) {
+                    s.markErrored();
                 }
-                if (self.options.session_mode == .application and s.dirty) {
-                    _ = self.sendSessionUpdate(s);
-                }
+                should_try_send_application_session_update =
+                    self.options.session_mode == .application and s.dirty;
             }
         }
 
@@ -503,6 +503,13 @@ pub const Client = struct {
         self.mutex.lock();
         self.last_event_id = prepared_event.event_id;
         const accepted_id = self.last_event_id.?;
+        if (should_try_send_application_session_update) {
+            if (self.session) |*s| {
+                if (self.options.session_mode == .application and s.dirty) {
+                    _ = self.sendSessionUpdate(s);
+                }
+            }
+        }
         self.mutex.unlock();
 
         return accepted_id;
@@ -1131,6 +1138,16 @@ pub const Client = struct {
     fn frameFieldMatches(field: ?[]const u8, pattern: []const u8) bool {
         if (field) |value| {
             return std.mem.indexOf(u8, value, pattern) != null;
+        }
+        return false;
+    }
+
+    fn eventIncrementsSessionErrors(event: *const Event) bool {
+        if (event.level) |level| {
+            if (level == .err or level == .fatal) return true;
+        }
+        if (event.exception) |exception| {
+            return exception.values.len > 0;
         }
         return false;
     }
@@ -4557,7 +4574,38 @@ test "Client session counts errors even when events are sampled out" {
     client.captureException("SampledOutError", "three");
 
     try testing.expectEqual(@as(u32, 3), client.session.?.errors);
-    try testing.expectEqual(SessionStatus.errored, client.session.?.status);
+    try testing.expectEqual(SessionStatus.ok, client.session.?.status);
+}
+
+test "Client sampled-out errors defer session update submission until session end" {
+    var state = MultiPayloadTransportState.init(testing.allocator);
+    defer state.deinit();
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .release = "my-app@1.0.0",
+        .sample_rate = 0.0,
+        .transport = .{
+            .send_fn = multiPayloadTransportSendFn,
+            .ctx = &state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    client.startSession();
+    client.captureException("SampledOutError", "one");
+    client.captureException("SampledOutError", "two");
+    _ = client.flush(1000);
+    try testing.expectEqual(@as(usize, 0), state.sent_count);
+
+    client.endSession(.exited);
+    _ = client.flush(1000);
+
+    try testing.expectEqual(@as(usize, 1), state.sent_count);
+    try testing.expect(std.mem.indexOf(u8, state.payloads.items[0], "\"type\":\"session\"") != null);
+    try testing.expect(std.mem.indexOf(u8, state.payloads.items[0], "\"status\":\"exited\"") != null);
+    try testing.expect(std.mem.indexOf(u8, state.payloads.items[0], "\"errors\":2") != null);
 }
 
 test "Client session does not count errors when before_send drops event" {

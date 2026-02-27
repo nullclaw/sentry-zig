@@ -68,12 +68,9 @@ pub const Session = struct {
     }
 
     /// Mark the session as having an error. Increments errors count
-    /// and sets status to errored if currently ok.
+    /// while preserving non-terminal status semantics used by release health.
     pub fn markErrored(self: *Session) void {
         self.errors += 1;
-        if (self.status == .ok) {
-            self.status = .errored;
-        }
         self.touch();
         self.dirty = true;
     }
@@ -87,7 +84,10 @@ pub const Session = struct {
 
     /// End the session with the given status, computing duration.
     pub fn end(self: *Session, status: SessionStatus) void {
-        self.status = if (status == .ok) .exited else status;
+        self.status = switch (status) {
+            .ok, .errored => .exited,
+            else => status,
+        };
         self.touch();
         if (self.track_duration) {
             self.duration = self.timestamp - self.started;
@@ -192,18 +192,18 @@ test "Session.start creates valid session" {
     try testing.expectEqual(@as(u32, 0), session.errors);
 }
 
-test "Session.markErrored increments errors and sets status" {
+test "Session.markErrored increments errors and preserves ok status" {
     var session = Session.start("app@1.0", "dev");
     const before_seq = session.sequence;
 
     session.markErrored();
     try testing.expectEqual(@as(u32, 1), session.errors);
-    try testing.expectEqual(SessionStatus.errored, session.status);
+    try testing.expectEqual(SessionStatus.ok, session.status);
     try testing.expect(session.sequence > before_seq);
 
     session.markErrored();
     try testing.expectEqual(@as(u32, 2), session.errors);
-    try testing.expectEqual(SessionStatus.errored, session.status);
+    try testing.expectEqual(SessionStatus.ok, session.status);
 }
 
 test "Session.markCrashed sets status" {

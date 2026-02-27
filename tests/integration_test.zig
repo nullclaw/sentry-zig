@@ -448,9 +448,9 @@ test "Session lifecycle: start, error, end" {
     try testing.expect(session.init_flag);
     try testing.expect(session.started > 1704067200.0);
 
-    // Mark as errored
+    // Mark as errored (counter only, status remains ok until session end)
     session.markErrored();
-    try testing.expectEqual(sentry.SessionStatus.errored, session.status);
+    try testing.expectEqual(sentry.SessionStatus.ok, session.status);
     try testing.expectEqual(@as(u32, 1), session.errors);
 
     // End the session
@@ -1157,7 +1157,7 @@ test "CJM e2e: invalid explicit transaction sample_rate drops transaction" {
     try testing.expectEqual(@as(usize, 0), relay.requestCount());
 }
 
-test "CJM e2e: session emits errored and exited updates" {
+test "CJM e2e: session emits ok and exited updates with incremented errors" {
     var relay = try CaptureRelay.init(testing.allocator, &.{});
     defer relay.deinit();
     try relay.start();
@@ -1181,7 +1181,7 @@ test "CJM e2e: session emits errored and exited updates" {
     try testing.expect(relay.waitForAtLeast(3, 2000));
 
     try testing.expect(relay.containsInAny("\"type\":\"session\""));
-    try testing.expect(relay.containsInAny("\"status\":\"errored\""));
+    try testing.expect(relay.containsInAny("\"status\":\"ok\""));
     try testing.expect(relay.containsInAny("\"seq\":"));
     try testing.expect(relay.containsInAny("\"errors\":1"));
     try testing.expect(relay.containsInAny("\"status\":\"exited\""));
