@@ -565,6 +565,17 @@ test "global wrappers route through current hub" {
     defer continued_from_traceparent.deinit();
     try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", continued_from_traceparent.trace_id[0..]);
 
+    const traceparent_headers = [_]PropagationHeader{
+        .{ .name = "traceparent", .value = "00-fedcba9876543210fedcba9876543210-0123456789abcdef-00" },
+    };
+    var continued_from_traceparent_headers = startTransactionFromHeaders(
+        .{ .name = "GET /continued-global-traceparent-headers", .op = "http.server" },
+        &traceparent_headers,
+    ).?;
+    defer continued_from_traceparent_headers.deinit();
+    try std.testing.expectEqualStrings("fedcba9876543210fedcba9876543210", continued_from_traceparent_headers.trace_id[0..]);
+    try std.testing.expectEqual(@as(?bool, false), continued_from_traceparent_headers.parent_sampled);
+
     var continued_from_span = startTransactionFromSpan(
         .{ .name = "GET /continued-global-span", .op = "http.server" },
         .{ .transaction = &txn },

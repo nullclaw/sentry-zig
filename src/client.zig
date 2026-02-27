@@ -906,6 +906,7 @@ pub const Client = struct {
         headers: []const PropagationHeader,
     ) Transaction {
         var sentry_trace_header: ?[]const u8 = null;
+        var traceparent_header: ?[]const u8 = null;
         var baggage_header: ?[]const u8 = null;
 
         for (headers) |header| {
@@ -914,16 +915,51 @@ pub const Client = struct {
                 sentry_trace_header = header.value;
                 continue;
             }
+            if (traceparent_header == null and std.ascii.eqlIgnoreCase(name, "traceparent")) {
+                traceparent_header = header.value;
+                continue;
+            }
             if (baggage_header == null and std.ascii.eqlIgnoreCase(name, "baggage")) {
                 baggage_header = header.value;
             }
         }
 
-        return self.startTransactionFromPropagationHeaders(
-            opts,
-            sentry_trace_header,
-            baggage_header,
-        ) catch self.startTransaction(opts);
+        if (sentry_trace_header) |sentry_trace| {
+            if (self.startTransactionFromPropagationHeaders(
+                opts,
+                sentry_trace,
+                baggage_header,
+            ) catch null) |continued| {
+                return continued;
+            }
+        }
+
+        if (traceparent_header) |traceparent| {
+            if (propagation.parseTraceParent(traceparent)) |parsed| {
+                var converted_sentry_trace: [51]u8 = undefined;
+                @memcpy(converted_sentry_trace[0..32], parsed.trace_id[0..]);
+                converted_sentry_trace[32] = '-';
+                @memcpy(converted_sentry_trace[33..49], parsed.parent_span_id[0..]);
+                converted_sentry_trace[49] = '-';
+                converted_sentry_trace[50] = if (parsed.sampled == true) '1' else '0';
+
+                if (self.startTransactionFromPropagationHeaders(
+                    opts,
+                    converted_sentry_trace[0..],
+                    baggage_header,
+                ) catch null) |continued| {
+                    return continued;
+                }
+
+                var real_opts = opts;
+                real_opts.parent_trace_id = parsed.trace_id;
+                real_opts.parent_span_id = parsed.parent_span_id;
+                real_opts.parent_sampled = parsed.sampled;
+                return self.startTransaction(real_opts);
+            }
+        }
+
+        return self.startTransaction(opts);
     }
 
     /// Build `sentry-trace` header value for an outgoing downstream request.
@@ -4074,6 +4110,54 @@ test "Client startTransactionFromHeaders falls back on invalid sentry-trace" {
 
     try testing.expectEqual(@as(?[16]u8, null), txn.parent_span_id);
     try testing.expectEqual(@as(?bool, null), txn.parent_sampled);
+}
+
+test "Client startTransactionFromHeaders continues traceparent when sentry-trace is missing" {
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    const headers = [_]PropagationHeader{
+        .{ .name = "traceparent", .value = "00-0123456789abcdef0123456789abcdef-89abcdef01234567-01" },
+        .{ .name = "baggage", .value = "sentry-environment=prod" },
+    };
+    var txn = client.startTransactionFromHeaders(.{
+        .name = "GET /traceparent-fallback",
+        .op = "http.server",
+    }, &headers);
+    defer txn.deinit();
+
+    try testing.expectEqualStrings("0123456789abcdef0123456789abcdef", txn.trace_id[0..]);
+    try testing.expect(txn.parent_span_id != null);
+    try testing.expectEqualStrings("89abcdef01234567", txn.parent_span_id.?[0..]);
+    try testing.expectEqual(@as(?bool, true), txn.parent_sampled);
+}
+
+test "Client startTransactionFromHeaders uses traceparent when sentry-trace is invalid" {
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    const headers = [_]PropagationHeader{
+        .{ .name = "sentry-trace", .value = "invalid" },
+        .{ .name = "traceparent", .value = "00-fedcba9876543210fedcba9876543210-0123456789abcdef-00" },
+    };
+    var txn = client.startTransactionFromHeaders(.{
+        .name = "GET /traceparent-invalid-sentry-fallback",
+        .op = "http.server",
+    }, &headers);
+    defer txn.deinit();
+
+    try testing.expectEqualStrings("fedcba9876543210fedcba9876543210", txn.trace_id[0..]);
+    try testing.expect(txn.parent_span_id != null);
+    try testing.expectEqualStrings("0123456789abcdef", txn.parent_span_id.?[0..]);
+    try testing.expectEqual(@as(?bool, false), txn.parent_sampled);
 }
 
 test "Client startTransactionFromSpan continues from transaction context" {

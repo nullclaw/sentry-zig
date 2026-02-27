@@ -1567,6 +1567,40 @@ test "CJM e2e: startTransactionFromHeaders continues upstream trace identifiers"
     try testing.expect(relay.containsInAny("\"parent_span_id\":\"0123456789abcdef\""));
 }
 
+test "CJM e2e: startTransactionFromHeaders continues trace from traceparent fallback" {
+    var relay = try CaptureRelay.init(testing.allocator, &.{});
+    defer relay.deinit();
+    try relay.start();
+
+    const local_dsn = try makeLocalDsn(testing.allocator, relay.port());
+    defer testing.allocator.free(local_dsn);
+
+    const client = try sentry.init(testing.allocator, .{
+        .dsn = local_dsn,
+        .traces_sample_rate = 1.0,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    const headers = [_]sentry.PropagationHeader{
+        .{ .name = "traceparent", .value = "00-0123456789abcdef0123456789abcdef-89abcdef01234567-01" },
+        .{ .name = "baggage", .value = "sentry-environment=integration" },
+    };
+    var txn = client.startTransactionFromHeaders(.{
+        .name = "GET /continued-headers-traceparent",
+        .op = "http.server",
+    }, &headers);
+    defer txn.deinit();
+
+    client.finishTransaction(&txn);
+    try testing.expect(client.flush(2000));
+    try testing.expect(relay.waitForAtLeast(1, 2000));
+
+    try testing.expect(relay.containsInAny("\"type\":\"transaction\""));
+    try testing.expect(relay.containsInAny("\"trace_id\":\"0123456789abcdef0123456789abcdef\""));
+    try testing.expect(relay.containsInAny("\"parent_span_id\":\"89abcdef01234567\""));
+}
+
 test "CJM e2e: startTransactionFromSpan continues trace identifiers" {
     var relay = try CaptureRelay.init(testing.allocator, &.{});
     defer relay.deinit();

@@ -887,6 +887,29 @@ test "Hub startTransactionFromHeaders continues upstream trace" {
     try testing.expectEqualStrings("89abcdef01234567", txn.parent_span_id.?[0..]);
 }
 
+test "Hub startTransactionFromHeaders continues traceparent when sentry-trace is missing" {
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var hub = try Hub.init(testing.allocator, client);
+    defer hub.deinit();
+
+    const headers = [_]PropagationHeader{
+        .{ .name = "traceparent", .value = "00-0123456789abcdef0123456789abcdef-89abcdef01234567-01" },
+    };
+    var txn = hub.startTransactionFromHeaders(.{ .name = "GET /hub-traceparent-headers" }, &headers);
+    defer txn.deinit();
+
+    try testing.expectEqualStrings("0123456789abcdef0123456789abcdef", txn.trace_id[0..]);
+    try testing.expect(txn.parent_span_id != null);
+    try testing.expectEqualStrings("89abcdef01234567", txn.parent_span_id.?[0..]);
+    try testing.expectEqual(@as(?bool, true), txn.parent_sampled);
+}
+
 test "Hub startTransactionFromSpan continues from transaction context" {
     const client = try Client.init(testing.allocator, .{
         .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",

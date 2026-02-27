@@ -11,8 +11,8 @@ const TransactionOpts = @import("../transaction.zig").TransactionOpts;
 const TransactionOrSpan = @import("../transaction.zig").TransactionOrSpan;
 const SpanStatus = @import("../transaction.zig").SpanStatus;
 const PropagationHeader = @import("../propagation.zig").PropagationHeader;
+const propagation = @import("../propagation.zig");
 const SendOutcome = @import("../worker.zig").SendOutcome;
-const otel = @import("otel.zig");
 
 pub const RequestOptions = struct {
     name: []const u8,
@@ -510,7 +510,7 @@ pub fn extractIncomingPropagationHeaders(headers: []const PropagationHeader) Inc
 }
 
 fn sentryTraceFromTraceParent(traceparent: []const u8, output: *[51]u8) ?[]const u8 {
-    const parsed = otel.parseTraceParent(traceparent) orelse return null;
+    const parsed = propagation.parseTraceParent(traceparent) orelse return null;
     const sampled: u8 = if (parsed.sampled == true) '1' else '0';
 
     @memcpy(output[0..32], parsed.trace_id[0..]);

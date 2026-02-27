@@ -6,83 +6,19 @@ const Hub = @import("../hub.zig").Hub;
 const Span = @import("../transaction.zig").Span;
 const Transaction = @import("../transaction.zig").Transaction;
 const TransactionOpts = @import("../transaction.zig").TransactionOpts;
-const PropagationHeader = @import("../propagation.zig").PropagationHeader;
+const propagation = @import("../propagation.zig");
+const PropagationHeader = propagation.PropagationHeader;
 
-pub const TraceParentContext = struct {
-    trace_id: [32]u8,
-    parent_span_id: [16]u8,
-    sampled: ?bool = null,
-};
-
-fn parseHexNibble(c: u8) ?u8 {
-    return switch (c) {
-        '0'...'9' => c - '0',
-        'a'...'f' => c - 'a' + 10,
-        'A'...'F' => c - 'A' + 10,
-        else => null,
-    };
-}
-
-fn parseHexByte(chars: []const u8) ?u8 {
-    if (chars.len != 2) return null;
-    const hi = parseHexNibble(chars[0]) orelse return null;
-    const lo = parseHexNibble(chars[1]) orelse return null;
-    return (hi << 4) | lo;
-}
-
-fn isAllZeros(value: []const u8) bool {
-    for (value) |c| {
-        if (c != '0') return false;
-    }
-    return true;
-}
+pub const TraceParentContext = propagation.TraceParentContext;
 
 /// Parse W3C `traceparent` header.
 pub fn parseTraceParent(traceparent: []const u8) ?TraceParentContext {
-    const trimmed = std.mem.trim(u8, traceparent, " \t");
-    var it = std.mem.splitScalar(u8, trimmed, '-');
-
-    const version = it.next() orelse return null;
-    const trace_id_text = it.next() orelse return null;
-    const span_id_text = it.next() orelse return null;
-    const flags_text = it.next() orelse return null;
-
-    if (version.len != 2 or trace_id_text.len != 32 or span_id_text.len != 16 or flags_text.len != 2) return null;
-    _ = parseHexNibble(version[0]) orelse return null;
-    _ = parseHexNibble(version[1]) orelse return null;
-    if (std.ascii.eqlIgnoreCase(version, "ff")) return null;
-    if (std.mem.eql(u8, version, "00") and it.next() != null) return null;
-    if (isAllZeros(trace_id_text) or isAllZeros(span_id_text)) return null;
-
-    var trace_id: [32]u8 = undefined;
-    for (trace_id_text, 0..) |c, i| {
-        _ = parseHexNibble(c) orelse return null;
-        trace_id[i] = std.ascii.toLower(c);
-    }
-
-    var parent_span_id: [16]u8 = undefined;
-    for (span_id_text, 0..) |c, i| {
-        _ = parseHexNibble(c) orelse return null;
-        parent_span_id[i] = std.ascii.toLower(c);
-    }
-
-    const flags = parseHexByte(flags_text) orelse return null;
-    return .{
-        .trace_id = trace_id,
-        .parent_span_id = parent_span_id,
-        .sampled = (flags & 1) != 0,
-    };
+    return propagation.parseTraceParent(traceparent);
 }
 
 /// Find and parse `traceparent` from raw header list.
 pub fn parseTraceParentFromHeaders(headers: []const PropagationHeader) ?TraceParentContext {
-    for (headers) |header| {
-        const name = std.mem.trim(u8, header.name, " \t");
-        if (std.ascii.eqlIgnoreCase(name, "traceparent")) {
-            return parseTraceParent(header.value);
-        }
-    }
-    return null;
+    return propagation.parseTraceParentFromHeaders(headers);
 }
 
 /// Build W3C `traceparent` header from transaction context.

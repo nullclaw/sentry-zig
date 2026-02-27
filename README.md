@@ -214,6 +214,7 @@ var txn3 = client.startTransactionFromHeaders(
     &headers,
 );
 defer txn3.deinit();
+// If sentry-trace is missing, traceparent is used as fallback automatically.
 var txn4 = client.startTransactionFromSpan(
     .{ .name = "GET /orders-fanout", .op = "worker" },
     .{ .transaction = &txn2 },
