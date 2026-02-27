@@ -76,6 +76,8 @@ pub const RateLimitCategory = @import("ratelimit.zig").Category;
 pub const RateLimitUpdate = @import("ratelimit.zig").Update;
 pub const RateLimitState = @import("ratelimit.zig").State;
 pub const signal_handler = @import("signal_handler.zig");
+pub const testkit = @import("testkit.zig");
+pub const @"test" = @import("testkit.zig");
 
 /// Initialize a new Sentry client with the given options.
 pub fn init(allocator: std.mem.Allocator, options: Options) !*Client {

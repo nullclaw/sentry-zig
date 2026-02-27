@@ -25,7 +25,8 @@ in a production application.
 18. [Security and Data Governance](#security-and-data-governance)
 19. [Production Checklist](#production-checklist)
 20. [Troubleshooting](#troubleshooting)
-21. [Support Model](#support-model)
+21. [Testing Helpers](#testing-helpers)
+22. [Support Model](#support-model)
 
 ## Quick Start
 
@@ -691,6 +692,36 @@ Operational guidance:
 - Check queue saturation patterns in your service lifecycle.
 - Reduce envelope size (`max_request_body_size`, attachment payloads).
 - Verify Sentry rate-limit responses (`Retry-After`, `X-Sentry-Rate-Limits`).
+
+## Testing Helpers
+
+Use `sentry.testkit` for in-process capture tests without external relay setup.
+
+```zig
+const std = @import("std");
+const sentry = @import("sentry-zig");
+
+fn capture(client: *sentry.Client, _: ?*anyopaque) !void {
+    _ = client.captureMessageId("sdk-test-message", .warning);
+}
+
+var events = try sentry.testkit.withCapturedEvents(
+    std.testing.allocator,
+    capture,
+    null,
+);
+defer events.deinit();
+
+try std.testing.expectEqual(@as(usize, 1), events.items.len);
+```
+
+Available helpers:
+
+- `sentry.testkit.TestTransport`
+- `sentry.testkit.withCapturedEnvelopes(...)`
+- `sentry.testkit.withCapturedEnvelopesOptions(...)`
+- `sentry.testkit.withCapturedEvents(...)`
+- `sentry.testkit.withCapturedEventsOptions(...)`
 
 ## Support Model
 

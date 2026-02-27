@@ -370,6 +370,24 @@ Run integration tests only:
 zig build test-integration
 ```
 
+Test capture helpers:
+
+```zig
+const std = @import("std");
+const sentry = @import("sentry-zig");
+
+fn capture(client: *sentry.Client, _: ?*anyopaque) !void {
+    _ = client.captureMessageId("hello testkit", .info);
+}
+
+var events = try sentry.testkit.withCapturedEvents(
+    std.testing.allocator,
+    capture,
+    null,
+);
+defer events.deinit();
+```
+
 Tracing note: each transaction stores up to `1000` child spans (`MAX_SPANS`).
 
 ## Resources
