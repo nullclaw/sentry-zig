@@ -10,23 +10,24 @@ in a production application.
 3. [Build and Delivery Model](#build-and-delivery-model)
 4. [Integration in build.zig](#integration-in-buildzig)
 5. [CI/CD Reference](#cicd-reference)
-6. [Client Lifecycle](#client-lifecycle)
-7. [Event Capture and event_id](#event-capture-and-event_id)
-8. [Working with Scope](#working-with-scope)
-9. [Attachments](#attachments)
-10. [Tracing and Transactions](#tracing-and-transactions)
-11. [Release Health Sessions](#release-health-sessions)
-12. [Monitor Check-Ins](#monitor-check-ins)
-13. [Structured Logs](#structured-logs)
-14. [Hooks and Processors](#hooks-and-processors)
-15. [Rate Limits and Queue](#rate-limits-and-queue)
-16. [Crash Handling (POSIX)](#crash-handling-posix)
-17. [Performance Tuning](#performance-tuning)
-18. [Security and Data Governance](#security-and-data-governance)
-19. [Production Checklist](#production-checklist)
-20. [Troubleshooting](#troubleshooting)
-21. [Testing Helpers](#testing-helpers)
-22. [Support Model](#support-model)
+6. [Auto Integrations](#auto-integrations)
+7. [Client Lifecycle](#client-lifecycle)
+8. [Event Capture and event_id](#event-capture-and-event_id)
+9. [Working with Scope](#working-with-scope)
+10. [Attachments](#attachments)
+11. [Tracing and Transactions](#tracing-and-transactions)
+12. [Release Health Sessions](#release-health-sessions)
+13. [Monitor Check-Ins](#monitor-check-ins)
+14. [Structured Logs](#structured-logs)
+15. [Hooks and Processors](#hooks-and-processors)
+16. [Rate Limits and Queue](#rate-limits-and-queue)
+17. [Crash Handling (POSIX)](#crash-handling-posix)
+18. [Performance Tuning](#performance-tuning)
+19. [Security and Data Governance](#security-and-data-governance)
+20. [Production Checklist](#production-checklist)
+21. [Troubleshooting](#troubleshooting)
+22. [Testing Helpers](#testing-helpers)
+23. [Support Model](#support-model)
 
 ## Quick Start
 
@@ -123,6 +124,61 @@ Release checklist:
 2. Tag the repository (`vX.Y.Z`).
 3. Validate integration tests against the tag.
 4. Roll out in staged environments before production.
+
+## Auto Integrations
+
+### Global init guard
+
+`initGlobal` creates a client, binds a Hub as current TLS Hub, and returns a guard.
+When the guard is deinitialized, the previous Hub is restored.
+
+```zig
+var guard = try sentry.initGlobal(allocator, .{
+    .dsn = "https://PUBLIC_KEY@o0.ingest.sentry.io/PROJECT_ID",
+    .release = "my-app@1.0.0",
+    .environment = "production",
+    .install_signal_handlers = false,
+});
+defer guard.deinit();
+
+_ = sentry.captureMessage("captured through global API", .info);
+```
+
+### std.log integration helper
+
+Set a custom `std_options.logFn` in your app root and install integration config:
+
+```zig
+pub const std_options: std.Options = .{
+    .logFn = sentry.integrations.log.logFn,
+};
+```
+
+```zig
+sentry.integrations.log.install(.{
+    .min_level = .info,
+    .include_scope_prefix = true,
+    .forward_to_default_logger = true,
+    .max_message_bytes = 2048,
+});
+```
+
+### panic integration helper
+
+Forward panics to Sentry before Zig default panic handling:
+
+```zig
+pub const panic = std.debug.FullPanic(sentry.integrations.panic.captureAndForward);
+```
+
+Optional runtime configuration:
+
+```zig
+sentry.integrations.panic.install(.{
+    .exception_type = "AppPanic",
+    .flush_timeout_ms = 2000,
+});
+```
 
 ## Client Lifecycle
 

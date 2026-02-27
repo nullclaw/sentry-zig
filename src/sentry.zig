@@ -76,12 +76,73 @@ pub const RateLimitCategory = @import("ratelimit.zig").Category;
 pub const RateLimitUpdate = @import("ratelimit.zig").Update;
 pub const RateLimitState = @import("ratelimit.zig").State;
 pub const signal_handler = @import("signal_handler.zig");
+pub const integrations = @import("integrations.zig");
 pub const testkit = @import("testkit.zig");
 pub const @"test" = @import("testkit.zig");
+
+/// Guard returned by `initGlobal`.
+///
+/// It owns the created `Client` and `Hub` and restores the previous thread-local
+/// Hub when deinitialized.
+pub const InitGuard = struct {
+    allocator: std.mem.Allocator,
+    client: *Client,
+    hub: *Hub,
+    previous_hub: ?*Hub,
+    active: bool = true,
+
+    pub fn clientPtr(self: *InitGuard) *Client {
+        return self.client;
+    }
+
+    pub fn hubPtr(self: *InitGuard) *Hub {
+        return self.hub;
+    }
+
+    pub fn deinit(self: *InitGuard) void {
+        if (!self.active) return;
+        self.active = false;
+
+        if (Hub.current()) |current| {
+            if (current == self.hub) {
+                _ = Hub.clearCurrent();
+                if (self.previous_hub) |previous| {
+                    _ = Hub.setCurrent(previous);
+                }
+            }
+        }
+
+        self.hub.deinit();
+        self.allocator.destroy(self.hub);
+        self.client.deinit();
+    }
+};
 
 /// Initialize a new Sentry client with the given options.
 pub fn init(allocator: std.mem.Allocator, options: Options) !*Client {
     return Client.init(allocator, options);
+}
+
+/// Initialize a new client, create a Hub, and bind it as the current thread-local Hub.
+///
+/// Deinitialize the returned guard to restore the previous Hub and release resources.
+pub fn initGlobal(allocator: std.mem.Allocator, options: Options) !InitGuard {
+    const client = try init(allocator, options);
+    errdefer client.deinit();
+
+    const hub = try allocator.create(Hub);
+    errdefer allocator.destroy(hub);
+
+    hub.* = try Hub.init(allocator, client);
+    errdefer hub.deinit();
+
+    const previous_hub = Hub.setCurrent(hub);
+    return .{
+        .allocator = allocator,
+        .client = client,
+        .hub = hub,
+        .previous_hub = previous_hub,
+    };
 }
 
 pub fn setCurrentHub(hub: *Hub) ?*Hub {
@@ -506,6 +567,44 @@ test "global wrappers route through current hub" {
     try std.testing.expect(close(1000));
     try std.testing.expect(captureLogMessage("global-log-after-close", .warn));
     try std.testing.expect(captureMessage("global-capture-after-close", .warning) == null);
+}
+
+test "initGlobal binds current hub and clears it on deinit" {
+    try std.testing.expect(currentHub() == null);
+
+    var guard = try initGlobal(std.testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .install_signal_handlers = false,
+    });
+    try std.testing.expect(currentHub() != null);
+    try std.testing.expect(currentHub().? == guard.hubPtr());
+    try std.testing.expect(captureMessage("init-global-message", .info) != null);
+
+    guard.deinit();
+    try std.testing.expect(currentHub() == null);
+}
+
+test "initGlobal restores previous hub on deinit" {
+    const base_client = try Client.init(std.testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .install_signal_handlers = false,
+    });
+    defer base_client.deinit();
+
+    var base_hub = try Hub.init(std.testing.allocator, base_client);
+    defer base_hub.deinit();
+
+    _ = setCurrentHub(&base_hub);
+    defer _ = clearCurrentHub();
+
+    var guard = try initGlobal(std.testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .install_signal_handlers = false,
+    });
+    try std.testing.expect(currentHub().? == guard.hubPtr());
+
+    guard.deinit();
+    try std.testing.expect(currentHub().? == &base_hub);
 }
 
 test {

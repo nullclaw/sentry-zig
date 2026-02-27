@@ -110,6 +110,7 @@ jobs:
 ## Core Concepts
 
 - `Client`: owns transport, worker queue, and runtime configuration.
+- `InitGuard`: helper returned by `initGlobal` that binds/restores TLS Hub automatically.
 - `Scope`: mutable event context (user, tags, extras, breadcrumbs, attachments).
 - `Hub`: scope stack + thread-local current hub API for scoped captures.
 - Global helpers via current Hub: `captureMessage`, `captureException`, `captureError`, `captureCheckIn`, `startSession`, `endSession`, `flush`, `close`, `addBreadcrumb`, `pushScope`, `configureScope`, `withIntegration`.
@@ -147,6 +148,7 @@ jobs:
 | Signal crash marker flow | Implemented | POSIX marker write/read cycle |
 | Hub/TLS scope stack | Implemented | Push/pop scopes + TLS current hub helpers |
 | Structured logs pipeline | Implemented | `log` envelope items + `captureLogMessage` API |
+| Auto integration helpers | Implemented | Global init guard + std.log/panic helper integrations |
 | Extended integrations | Roadmap | Additional framework/runtime integrations will be added incrementally |
 
 ## Common Usage
@@ -277,6 +279,21 @@ hub.captureMessage("scoped event", .info);
 _ = sentry.setCurrentHub(&hub);
 defer _ = sentry.clearCurrentHub();
 _ = sentry.captureMessage("global scoped capture", .warning);
+```
+
+```zig
+// Global bootstrap that binds a Hub automatically (guard restores previous hub)
+var guard = try sentry.initGlobal(allocator, .{
+    .dsn = "https://PUBLIC_KEY@o0.ingest.sentry.io/PROJECT_ID",
+    .install_signal_handlers = false,
+});
+defer guard.deinit();
+
+// std.log integration helper (set this as std_options.logFn in your app root)
+sentry.integrations.log.install(.{
+    .min_level = .info,
+    .forward_to_default_logger = true,
+});
 ```
 
 ## Configuration
