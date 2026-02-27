@@ -80,6 +80,11 @@ pub const Hub = struct {
         return self.topScope();
     }
 
+    /// Access underlying client bound to this hub.
+    pub fn clientPtr(self: *Hub) *Client {
+        return self.client;
+    }
+
     pub fn pushScope(self: *Hub) !void {
         const cloned = try self.topScope().clone(self.allocator);
         errdefer {

@@ -203,6 +203,35 @@ sentry.integrations.auto.installRuntime(.{
 });
 ```
 
+One-call bootstrap variant (runtime config + built-in integration defaults):
+
+```zig
+const client = try sentry.integrations.auto.initWithDefaultsAndRuntime(allocator, .{
+    .dsn = "https://PUBLIC_KEY@o0.ingest.sentry.io/PROJECT_ID",
+}, .{
+    .log = .{
+        .min_level = .info,
+        .forward_to_default_logger = false,
+    },
+    .panic = .{
+        .exception_type = "AppPanic",
+    },
+});
+defer client.deinit();
+```
+
+Global one-call variant:
+
+```zig
+var guard = try sentry.integrations.auto.initGlobalWithDefaultsAndRuntime(allocator, .{
+    .dsn = "https://PUBLIC_KEY@o0.ingest.sentry.io/PROJECT_ID",
+}, .{
+    .log = .{ .min_level = .info },
+    .panic = .{ .exception_type = "AppPanic" },
+});
+defer guard.deinit();
+```
+
 ### panic integration helper
 
 Forward panics to Sentry before Zig default panic handling:
@@ -271,6 +300,23 @@ const status = try sentry.integrations.http.runIncomingRequest(
 _ = status;
 ```
 
+Current TLS Hub variant (no explicit `client` parameter):
+
+```zig
+const status = try sentry.integrations.auto.runIncomingRequestWithCurrentHub(
+    allocator,
+    .{
+        .name = "GET /orders/:id",
+        .method = "GET",
+        .url = "https://api.example.com/orders/42",
+    },
+    incomingHandler,
+    handler_ctx,
+    .{},
+);
+_ = status;
+```
+
 Header-driven variant:
 
 ```zig
@@ -293,6 +339,24 @@ const status = try sentry.integrations.http.runIncomingRequestFromHeaders(
 );
 _ = status;
 // traceparent is also supported when sentry-trace header is absent.
+```
+
+Current TLS Hub header-driven variant:
+
+```zig
+const status = try sentry.integrations.auto.runIncomingRequestFromHeadersWithCurrentHub(
+    allocator,
+    .{
+        .name = "GET /orders/:id",
+        .method = "GET",
+        .url = "https://api.example.com/orders/42",
+    },
+    &headers,
+    incomingHandler,
+    handler_ctx,
+    .{},
+);
+_ = status;
 ```
 
 ### Outgoing HTTP request integration helper

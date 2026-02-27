@@ -5,6 +5,8 @@ const Client = @import("../client.zig").Client;
 const Integration = @import("../client.zig").Integration;
 const Options = @import("../client.zig").Options;
 const Hub = @import("../hub.zig").Hub;
+const SendOutcome = @import("../worker.zig").SendOutcome;
+const http = @import("http.zig");
 const log = @import("log.zig");
 const panic_integration = @import("panic.zig");
 
@@ -122,6 +124,77 @@ pub fn initGlobalWithDefaults(allocator: std.mem.Allocator, options: Options) !I
     };
 }
 
+/// Install runtime config and initialize client with default integrations.
+pub fn initWithDefaultsAndRuntime(
+    allocator: std.mem.Allocator,
+    options: Options,
+    runtime_options: RuntimeInstallOptions,
+) !*Client {
+    installRuntime(runtime_options);
+    return initWithDefaults(allocator, options);
+}
+
+/// Install runtime config and initialize global hub with default integrations.
+pub fn initGlobalWithDefaultsAndRuntime(
+    allocator: std.mem.Allocator,
+    options: Options,
+    runtime_options: RuntimeInstallOptions,
+) !InitGuard {
+    installRuntime(runtime_options);
+    return initGlobalWithDefaults(allocator, options);
+}
+
+/// Run incoming HTTP handler using client from current hub.
+pub fn runIncomingRequestWithCurrentHub(
+    allocator: std.mem.Allocator,
+    request_options: http.RequestOptions,
+    handler: http.IncomingHandlerFn,
+    handler_ctx: ?*anyopaque,
+    run_options: http.IncomingRunOptions,
+) anyerror!u16 {
+    const hub = Hub.current() orelse return error.NoCurrentHub;
+    return http.runIncomingRequest(
+        allocator,
+        hub.clientPtr(),
+        request_options,
+        handler,
+        handler_ctx,
+        run_options,
+    );
+}
+
+/// Same as `runIncomingRequestWithCurrentHub`, with propagation headers auto-extracted from raw headers.
+pub fn runIncomingRequestFromHeadersWithCurrentHub(
+    allocator: std.mem.Allocator,
+    request_options: http.RequestOptions,
+    headers: []const @import("../propagation.zig").PropagationHeader,
+    handler: http.IncomingHandlerFn,
+    handler_ctx: ?*anyopaque,
+    run_options: http.IncomingRunOptions,
+) anyerror!u16 {
+    const hub = Hub.current() orelse return error.NoCurrentHub;
+    return http.runIncomingRequestFromHeaders(
+        allocator,
+        hub.clientPtr(),
+        request_options,
+        headers,
+        handler,
+        handler_ctx,
+        run_options,
+    );
+}
+
+/// Run outgoing HTTP operation requiring an already active current hub/span context.
+pub fn runOutgoingRequestWithCurrentHub(
+    request_options: http.OutgoingRequestOptions,
+    handler: http.OutgoingHandlerFn,
+    handler_ctx: ?*anyopaque,
+    run_options: http.OutgoingRunOptions,
+) anyerror!u16 {
+    if (Hub.current() == null) return error.NoCurrentHub;
+    return http.runOutgoingRequest(request_options, handler, handler_ctx, run_options);
+}
+
 var lookup_called: bool = false;
 var lookup_received_null: bool = false;
 
@@ -133,6 +206,32 @@ fn inspectLookup(ctx: ?*anyopaque) void {
 fn testUserIntegrationSetup(_: *Client, ctx: ?*anyopaque) void {
     const called: *bool = @ptrCast(@alignCast(ctx.?));
     called.* = true;
+}
+
+const PayloadState = struct {
+    allocator: std.mem.Allocator,
+    payloads: std.ArrayListUnmanaged([]u8) = .{},
+
+    fn deinit(self: *PayloadState) void {
+        for (self.payloads.items) |payload| self.allocator.free(payload);
+        self.payloads.deinit(self.allocator);
+        self.* = undefined;
+    }
+};
+
+fn payloadSendFn(data: []const u8, ctx: ?*anyopaque) SendOutcome {
+    const state: *PayloadState = @ptrCast(@alignCast(ctx.?));
+    const copied = state.allocator.dupe(u8, data) catch return .{};
+    state.payloads.append(state.allocator, copied) catch state.allocator.free(copied);
+    return .{};
+}
+
+fn incomingOkHandler(_: *http.RequestContext, _: ?*anyopaque) anyerror!u16 {
+    return 204;
+}
+
+fn outgoingOkHandler(_: *http.OutgoingRequestContext, _: ?*anyopaque) anyerror!u16 {
+    return 200;
 }
 
 test "auto defaults expose log and panic setup callbacks" {
@@ -222,4 +321,175 @@ test "installRuntime updates log and panic integration configs" {
     const panic_config = panic_integration.currentConfig();
     try testing.expectEqualStrings("AutoRuntimePanic", panic_config.exception_type);
     try testing.expectEqual(@as(u64, 321), panic_config.flush_timeout_ms);
+}
+
+test "initWithDefaultsAndRuntime applies runtime config and integration defaults" {
+    log.reset();
+    panic_integration.reset();
+    defer {
+        log.reset();
+        panic_integration.reset();
+    }
+
+    const client = try initWithDefaultsAndRuntime(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .install_signal_handlers = false,
+    }, .{
+        .log = .{
+            .min_level = .warn,
+            .forward_to_default_logger = false,
+        },
+        .panic = .{
+            .exception_type = "AutoInitPanic",
+        },
+    });
+    defer client.deinit();
+
+    const log_config = log.currentConfig();
+    try testing.expectEqual(std.log.Level.warn, log_config.min_level);
+    try testing.expect(!log_config.forward_to_default_logger);
+    try testing.expect(client.withIntegration(log.setup, inspectLookup));
+    try testing.expect(client.withIntegration(panic_integration.setup, inspectLookup));
+
+    const panic_config = panic_integration.currentConfig();
+    try testing.expectEqualStrings("AutoInitPanic", panic_config.exception_type);
+}
+
+test "runIncomingRequestWithCurrentHub uses current hub client" {
+    var payload_state = PayloadState{ .allocator = testing.allocator };
+    defer payload_state.deinit();
+
+    const client = try initWithDefaults(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .transport = .{
+            .send_fn = payloadSendFn,
+            .ctx = &payload_state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var hub = try Hub.init(testing.allocator, client);
+    defer hub.deinit();
+
+    _ = Hub.setCurrent(&hub);
+    defer _ = Hub.clearCurrent();
+
+    const status_code = try runIncomingRequestWithCurrentHub(
+        testing.allocator,
+        .{
+            .name = "GET /auto/current",
+            .method = "GET",
+            .url = "https://api.example.com/auto/current",
+        },
+        incomingOkHandler,
+        null,
+        .{},
+    );
+    try testing.expectEqual(@as(u16, 204), status_code);
+
+    try testing.expect(client.flush(1000));
+
+    var saw_transaction = false;
+    for (payload_state.payloads.items) |payload| {
+        if (std.mem.indexOf(u8, payload, "\"type\":\"transaction\"") == null) continue;
+        saw_transaction = true;
+        try testing.expect(std.mem.indexOf(u8, payload, "\"name\":\"GET /auto/current\"") != null);
+        try testing.expect(std.mem.indexOf(u8, payload, "\"op\":\"http.server\"") != null);
+        try testing.expect(std.mem.indexOf(u8, payload, "\"status\":\"ok\"") != null);
+    }
+    try testing.expect(saw_transaction);
+}
+
+test "runIncomingRequestWithCurrentHub requires current hub" {
+    _ = Hub.clearCurrent();
+    try testing.expect(Hub.current() == null);
+
+    try testing.expectError(
+        error.NoCurrentHub,
+        runIncomingRequestWithCurrentHub(
+            testing.allocator,
+            .{ .name = "GET /auto/no-hub" },
+            incomingOkHandler,
+            null,
+            .{},
+        ),
+    );
+}
+
+test "runIncomingRequestFromHeadersWithCurrentHub continues trace from extracted headers" {
+    var payload_state = PayloadState{ .allocator = testing.allocator };
+    defer payload_state.deinit();
+
+    const client = try initWithDefaults(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .transport = .{
+            .send_fn = payloadSendFn,
+            .ctx = &payload_state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var hub = try Hub.init(testing.allocator, client);
+    defer hub.deinit();
+
+    _ = Hub.setCurrent(&hub);
+    defer _ = Hub.clearCurrent();
+
+    const headers = [_]@import("../propagation.zig").PropagationHeader{
+        .{
+            .name = "traceparent",
+            .value = "00-0123456789abcdef0123456789abcdef-89abcdef01234567-01",
+        },
+        .{
+            .name = "baggage",
+            .value = "sentry-release=edge,sentry-environment=prod",
+        },
+    };
+
+    const status_code = try runIncomingRequestFromHeadersWithCurrentHub(
+        testing.allocator,
+        .{
+            .name = "GET /auto/headers",
+            .method = "GET",
+            .url = "https://api.example.com/auto/headers",
+        },
+        &headers,
+        incomingOkHandler,
+        null,
+        .{},
+    );
+    try testing.expectEqual(@as(u16, 204), status_code);
+
+    try testing.expect(client.flush(1000));
+
+    var saw_trace = false;
+    for (payload_state.payloads.items) |payload| {
+        if (std.mem.indexOf(u8, payload, "\"type\":\"transaction\"") == null) continue;
+        if (std.mem.indexOf(u8, payload, "\"trace_id\":\"0123456789abcdef0123456789abcdef\"") != null) {
+            saw_trace = true;
+        }
+    }
+    try testing.expect(saw_trace);
+}
+
+test "runOutgoingRequestWithCurrentHub requires current hub" {
+    _ = Hub.clearCurrent();
+    try testing.expect(Hub.current() == null);
+
+    try testing.expectError(
+        error.NoCurrentHub,
+        runOutgoingRequestWithCurrentHub(
+            .{
+                .method = "GET",
+                .url = "https://api.example.com/no-hub",
+            },
+            outgoingOkHandler,
+            null,
+            .{},
+        ),
+    );
 }

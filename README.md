@@ -325,6 +325,33 @@ sentry.integrations.auto.installRuntime(.{
 ```
 
 ```zig
+// One-call bootstrap: apply runtime config + prepend built-ins + initialize client
+const client = try sentry.integrations.auto.initWithDefaultsAndRuntime(allocator, .{
+    .dsn = "https://PUBLIC_KEY@o0.ingest.sentry.io/PROJECT_ID",
+}, .{
+    .log = .{
+        .min_level = .info,
+        .forward_to_default_logger = false,
+    },
+    .panic = .{
+        .exception_type = "AppPanic",
+    },
+});
+defer client.deinit();
+```
+
+```zig
+// Global one-call variant: runtime config + default integrations + current TLS hub binding
+var guard = try sentry.integrations.auto.initGlobalWithDefaultsAndRuntime(allocator, .{
+    .dsn = "https://PUBLIC_KEY@o0.ingest.sentry.io/PROJECT_ID",
+}, .{
+    .log = .{ .min_level = .info },
+    .panic = .{ .exception_type = "AppPanic" },
+});
+defer guard.deinit();
+```
+
+```zig
 // HTTP request helper: starts/continues trace, binds per-request hub, maps status
 var req_ctx = try sentry.integrations.http.RequestContext.begin(allocator, client, .{
     .name = "GET /orders/:id",
@@ -361,6 +388,22 @@ _ = status;
 ```
 
 ```zig
+// Same flow but resolved from current TLS Hub (no explicit client argument)
+const status = try sentry.integrations.auto.runIncomingRequestWithCurrentHub(
+    allocator,
+    .{
+        .name = "GET /orders/:id",
+        .method = "GET",
+        .url = "https://api.example.com/orders/42",
+    },
+    incomingHandler,
+    handler_ctx,
+    .{},
+);
+_ = status;
+```
+
+```zig
 // Variant that extracts sentry-trace/baggage from raw headers automatically
 const incoming_headers = [_]sentry.PropagationHeader{
     .{ .name = "sentry-trace", .value = incoming_sentry_trace },
@@ -381,6 +424,23 @@ const status = try sentry.integrations.http.runIncomingRequestFromHeaders(
 );
 _ = status;
 // If sentry-trace is missing, traceparent is also supported automatically.
+```
+
+```zig
+// Current TLS Hub variant for header-driven inbound flow
+const status = try sentry.integrations.auto.runIncomingRequestFromHeadersWithCurrentHub(
+    allocator,
+    .{
+        .name = "GET /orders/:id",
+        .method = "GET",
+        .url = "https://api.example.com/orders/42",
+    },
+    &incoming_headers,
+    incomingHandler,
+    handler_ctx,
+    .{},
+);
+_ = status;
 ```
 
 ```zig
