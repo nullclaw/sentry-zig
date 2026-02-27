@@ -314,6 +314,17 @@ defer client.deinit();
 ```
 
 ```zig
+// Minimal runtime wiring helpers
+pub const std_options: std.Options = sentry.integrations.auto.stdOptions();
+pub const panic = sentry.integrations.auto.panicHandler;
+
+sentry.integrations.auto.installRuntime(.{
+    .log = .{ .min_level = .info },
+    .panic = .{ .exception_type = "AppPanic" },
+});
+```
+
+```zig
 // HTTP request helper: starts/continues trace, binds per-request hub, maps status
 var req_ctx = try sentry.integrations.http.RequestContext.begin(allocator, client, .{
     .name = "GET /orders/:id",

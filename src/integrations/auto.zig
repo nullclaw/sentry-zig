@@ -6,11 +6,11 @@ const Integration = @import("../client.zig").Integration;
 const Options = @import("../client.zig").Options;
 const Hub = @import("../hub.zig").Hub;
 const log = @import("log.zig");
-const panic = @import("panic.zig");
+const panic_integration = @import("panic.zig");
 
 const DEFAULTS = [_]Integration{
     .{ .setup = log.setup },
-    .{ .setup = panic.setup },
+    .{ .setup = panic_integration.setup },
 };
 
 /// Returns a static slice of built-in setup integrations intended for
@@ -21,6 +21,30 @@ const DEFAULTS = [_]Integration{
 /// - panic capture (`integrations.panic`)
 pub fn defaults() []const Integration {
     return &DEFAULTS;
+}
+
+/// Convenience std options for applications that want Sentry log capture with
+/// minimal boilerplate.
+pub fn stdOptions() std.Options {
+    return .{
+        .logFn = log.logFn,
+    };
+}
+
+/// Convenience panic handler alias for application root declaration:
+///
+/// `pub const panic = sentry.integrations.auto.panicHandler;`
+pub const panicHandler = std.debug.FullPanic(panic_integration.captureAndForward);
+
+pub const RuntimeInstallOptions = struct {
+    log: log.Config = .{},
+    panic: panic_integration.Config = .{},
+};
+
+/// Install default runtime integration configs in one call.
+pub fn installRuntime(options: RuntimeInstallOptions) void {
+    log.install(options.log);
+    panic_integration.install(options.panic);
 }
 
 /// Initialize a client with built-in integration defaults prepended to any
@@ -115,7 +139,7 @@ test "auto defaults expose log and panic setup callbacks" {
     const values = defaults();
     try testing.expectEqual(@as(usize, 2), values.len);
     try testing.expect(values[0].setup == log.setup);
-    try testing.expect(values[1].setup == panic.setup);
+    try testing.expect(values[1].setup == panic_integration.setup);
     try testing.expect(values[0].ctx == null);
     try testing.expect(values[1].ctx == null);
 }
@@ -144,7 +168,7 @@ test "initWithDefaults prepends built-ins and keeps user integration callbacks" 
 
     lookup_called = false;
     lookup_received_null = true;
-    try testing.expect(client.withIntegration(panic.setup, inspectLookup));
+    try testing.expect(client.withIntegration(panic_integration.setup, inspectLookup));
     try testing.expect(lookup_called);
     try testing.expect(lookup_received_null);
 }
@@ -161,4 +185,41 @@ test "initGlobalWithDefaults binds and restores TLS hub" {
 
     guard.deinit();
     try testing.expect(Hub.current() == null);
+}
+
+test "stdOptions wires logFn integration function" {
+    const options = stdOptions();
+    try testing.expect(options.logFn == log.logFn);
+}
+
+test "installRuntime updates log and panic integration configs" {
+    log.reset();
+    panic_integration.reset();
+    defer {
+        log.reset();
+        panic_integration.reset();
+    }
+
+    installRuntime(.{
+        .log = .{
+            .min_level = .info,
+            .include_scope_prefix = false,
+            .forward_to_default_logger = false,
+            .max_message_bytes = 64,
+        },
+        .panic = .{
+            .exception_type = "AutoRuntimePanic",
+            .flush_timeout_ms = 321,
+        },
+    });
+
+    const log_config = log.currentConfig();
+    try testing.expectEqual(std.log.Level.info, log_config.min_level);
+    try testing.expect(!log_config.include_scope_prefix);
+    try testing.expect(!log_config.forward_to_default_logger);
+    try testing.expectEqual(@as(usize, 64), log_config.max_message_bytes);
+
+    const panic_config = panic_integration.currentConfig();
+    try testing.expectEqualStrings("AutoRuntimePanic", panic_config.exception_type);
+    try testing.expectEqual(@as(u64, 321), panic_config.flush_timeout_ms);
 }

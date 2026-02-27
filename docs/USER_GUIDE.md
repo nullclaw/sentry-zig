@@ -191,6 +191,18 @@ var guard = try sentry.integrations.auto.initGlobalWithDefaults(allocator, .{
 defer guard.deinit();
 ```
 
+Minimal runtime wiring helpers:
+
+```zig
+pub const std_options: std.Options = sentry.integrations.auto.stdOptions();
+pub const panic = sentry.integrations.auto.panicHandler;
+
+sentry.integrations.auto.installRuntime(.{
+    .log = .{ .min_level = .info },
+    .panic = .{ .exception_type = "AppPanic" },
+});
+```
+
 ### panic integration helper
 
 Forward panics to Sentry before Zig default panic handling:
