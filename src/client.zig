@@ -44,6 +44,7 @@ const Uuid = @import("uuid.zig").Uuid;
 const ts = @import("timestamp.zig");
 const breadcrumb_input = @import("breadcrumb_input.zig");
 const debug_meta_mod = @import("debug_meta.zig");
+const event_enrichment_mod = @import("event_enrichment.zig");
 
 const ExceptionFrameOwnership = struct {
     allocator: Allocator,
@@ -450,26 +451,14 @@ pub const Client = struct {
             prepared_event.contexts = null;
         };
 
-        if (prepared_event.contexts == null) {
-            const contexts = buildDefaultTraceContexts(
-                self.allocator,
-                self.options.default_integrations,
-                propagation_context,
-            ) catch null;
-            if (contexts) |value| {
-                prepared_event.contexts = value;
-                owned_trace_contexts = value;
-            }
-        } else {
-            if (mergeDefaultTraceContexts(
-                self.allocator,
-                prepared_event,
-                self.options.default_integrations,
-                propagation_context,
-            ) catch null) |value| {
-                prepared_event.contexts = value;
-                owned_trace_contexts = value;
-            }
+        if (event_enrichment_mod.ensureDefaultTraceContexts(
+            self.allocator,
+            prepared_event,
+            self.options.default_integrations,
+            propagation_context,
+        ) catch null) |value| {
+            prepared_event.contexts = value;
+            owned_trace_contexts = value;
         }
 
         var owned_threads: ?json.Value = null;
@@ -479,7 +468,7 @@ pub const Client = struct {
         };
 
         if (self.options.attach_stacktrace and prepared_event.threads == null) {
-            const threads = buildSyntheticThreads(self.allocator) catch null;
+            const threads = event_enrichment_mod.buildSyntheticThreads(self.allocator) catch null;
             if (threads) |value| {
                 prepared_event.threads = value;
                 owned_threads = value;
@@ -1230,15 +1219,6 @@ pub const Client = struct {
         try putOwnedJsonEntry(allocator, object, key, .{ .string = value_copy });
     }
 
-    fn putOwnedBool(
-        allocator: Allocator,
-        object: *json.ObjectMap,
-        key: []const u8,
-        value: bool,
-    ) !void {
-        try putOwnedJsonEntry(allocator, object, key, .{ .bool = value });
-    }
-
     fn putOwnedStringIfMissing(
         allocator: Allocator,
         object: *json.ObjectMap,
@@ -1263,146 +1243,6 @@ pub const Client = struct {
         if (self.options.server_name orelse self.default_server_name) |server_name| {
             try putOwnedStringIfMissing(self.allocator, obj, "server.address", server_name);
         }
-    }
-
-    fn buildDefaultTraceContexts(
-        allocator: Allocator,
-        include_runtime_os: bool,
-        propagation_context: scope_mod.PropagationContext,
-    ) !json.Value {
-        var runtime_version_buf: [64]u8 = undefined;
-        const runtime_version = try std.fmt.bufPrint(
-            &runtime_version_buf,
-            "{d}.{d}.{d}",
-            .{
-                builtin.zig_version.major,
-                builtin.zig_version.minor,
-                builtin.zig_version.patch,
-            },
-        );
-
-        var trace_object = json.ObjectMap.init(allocator);
-        var trace_moved = false;
-        errdefer if (!trace_moved) {
-            var value: json.Value = .{ .object = trace_object };
-            scope_mod.deinitJsonValueDeep(allocator, &value);
-        };
-
-        try putOwnedString(allocator, &trace_object, "type", "trace");
-        try putOwnedString(allocator, &trace_object, "trace_id", &propagation_context.trace_id);
-        try putOwnedString(allocator, &trace_object, "span_id", &propagation_context.span_id);
-        try putOwnedBool(allocator, &trace_object, "sampled", false);
-
-        var runtime_object: json.ObjectMap = undefined;
-        var runtime_moved = true;
-        if (include_runtime_os) {
-            runtime_object = json.ObjectMap.init(allocator);
-            runtime_moved = false;
-            errdefer if (!runtime_moved) {
-                var value: json.Value = .{ .object = runtime_object };
-                scope_mod.deinitJsonValueDeep(allocator, &value);
-            };
-            try putOwnedString(allocator, &runtime_object, "name", "zig");
-            try putOwnedString(allocator, &runtime_object, "version", runtime_version);
-        }
-
-        var os_object: json.ObjectMap = undefined;
-        var os_moved = true;
-        if (include_runtime_os) {
-            os_object = json.ObjectMap.init(allocator);
-            os_moved = false;
-            errdefer if (!os_moved) {
-                var value: json.Value = .{ .object = os_object };
-                scope_mod.deinitJsonValueDeep(allocator, &value);
-            };
-            try putOwnedString(allocator, &os_object, "name", @tagName(builtin.os.tag));
-            try putOwnedString(allocator, &os_object, "arch", @tagName(builtin.cpu.arch));
-        }
-
-        var contexts_object = json.ObjectMap.init(allocator);
-        errdefer {
-            var value: json.Value = .{ .object = contexts_object };
-            scope_mod.deinitJsonValueDeep(allocator, &value);
-        }
-
-        try putOwnedJsonEntry(allocator, &contexts_object, "trace", .{ .object = trace_object });
-        trace_moved = true;
-        if (include_runtime_os) {
-            try putOwnedJsonEntry(allocator, &contexts_object, "runtime", .{ .object = runtime_object });
-            runtime_moved = true;
-            try putOwnedJsonEntry(allocator, &contexts_object, "os", .{ .object = os_object });
-            os_moved = true;
-        }
-        return .{ .object = contexts_object };
-    }
-
-    fn buildSyntheticThreads(allocator: Allocator) !json.Value {
-        var frame_object = json.ObjectMap.init(allocator);
-        var frame_moved = false;
-        errdefer if (!frame_moved) {
-            var value: json.Value = .{ .object = frame_object };
-            scope_mod.deinitJsonValueDeep(allocator, &value);
-        };
-
-        try putOwnedString(allocator, &frame_object, "function", "capture_event");
-        try putOwnedBool(allocator, &frame_object, "in_app", true);
-
-        var frames_array = json.Array.init(allocator);
-        var frames_moved = false;
-        errdefer if (!frames_moved) {
-            var value: json.Value = .{ .array = frames_array };
-            scope_mod.deinitJsonValueDeep(allocator, &value);
-        };
-
-        try frames_array.append(.{ .object = frame_object });
-        frame_moved = true;
-
-        var stacktrace_object = json.ObjectMap.init(allocator);
-        var stacktrace_moved = false;
-        errdefer if (!stacktrace_moved) {
-            var value: json.Value = .{ .object = stacktrace_object };
-            scope_mod.deinitJsonValueDeep(allocator, &value);
-        };
-
-        try putOwnedJsonEntry(allocator, &stacktrace_object, "frames", .{ .array = frames_array });
-        frames_moved = true;
-
-        var thread_object = json.ObjectMap.init(allocator);
-        var thread_moved = false;
-        errdefer if (!thread_moved) {
-            var value: json.Value = .{ .object = thread_object };
-            scope_mod.deinitJsonValueDeep(allocator, &value);
-        };
-
-        try putOwnedBool(allocator, &thread_object, "current", true);
-        try putOwnedJsonEntry(
-            allocator,
-            &thread_object,
-            "stacktrace",
-            .{ .object = stacktrace_object },
-        );
-        stacktrace_moved = true;
-
-        var threads_array = json.Array.init(allocator);
-        var threads_array_moved = false;
-        errdefer if (!threads_array_moved) {
-            var value: json.Value = .{ .array = threads_array };
-            scope_mod.deinitJsonValueDeep(allocator, &value);
-        };
-
-        try threads_array.append(.{ .object = thread_object });
-        thread_moved = true;
-
-        var threads_object = json.ObjectMap.init(allocator);
-        errdefer {
-            var value: json.Value = .{ .object = threads_object };
-            scope_mod.deinitJsonValueDeep(allocator, &value);
-        }
-
-        try putOwnedJsonEntry(allocator, &threads_object, "values", .{ .array = threads_array });
-        threads_array_moved = true;
-
-        return .{ .object = threads_object };
     }
 
     fn ensureDebugImageCodeFileCache(self: *Client) void {
@@ -1440,64 +1280,6 @@ pub const Client = struct {
         var images_copy = try scope_mod.cloneJsonValue(allocator, defaults_images);
         errdefer scope_mod.deinitJsonValueDeep(allocator, &images_copy);
         try putOwnedJsonEntry(allocator, &merged.object, "images", images_copy);
-        return merged;
-    }
-
-    fn mergeDefaultTraceContexts(
-        allocator: Allocator,
-        event: *Event,
-        include_runtime_os: bool,
-        propagation_context: scope_mod.PropagationContext,
-    ) !?json.Value {
-        const contexts = event.contexts orelse return null;
-        if (contexts != .object) return null;
-
-        const existing = contexts.object;
-        const need_trace = existing.get("trace") == null;
-        const need_runtime = include_runtime_os and existing.get("runtime") == null;
-        const need_os = include_runtime_os and existing.get("os") == null;
-        if (!need_trace and !need_runtime and !need_os) return null;
-
-        var merged = try scope_mod.cloneJsonValue(allocator, contexts);
-        errdefer scope_mod.deinitJsonValueDeep(allocator, &merged);
-        if (merged != .object) return null;
-
-        const defaults = try buildDefaultTraceContexts(
-            allocator,
-            include_runtime_os,
-            propagation_context,
-        );
-        defer {
-            var defaults_owned = defaults;
-            scope_mod.deinitJsonValueDeep(allocator, &defaults_owned);
-        }
-        if (defaults != .object) return null;
-
-        const merged_object = &merged.object;
-        const default_object = defaults.object;
-
-        if (need_trace) {
-            if (default_object.get("trace")) |trace_value| {
-                var trace_copy = try scope_mod.cloneJsonValue(allocator, trace_value);
-                errdefer scope_mod.deinitJsonValueDeep(allocator, &trace_copy);
-                try putOwnedJsonEntry(allocator, merged_object, "trace", trace_copy);
-            }
-        }
-        if (need_runtime) {
-            if (default_object.get("runtime")) |runtime_value| {
-                var runtime_copy = try scope_mod.cloneJsonValue(allocator, runtime_value);
-                errdefer scope_mod.deinitJsonValueDeep(allocator, &runtime_copy);
-                try putOwnedJsonEntry(allocator, merged_object, "runtime", runtime_copy);
-            }
-        }
-        if (need_os) {
-            if (default_object.get("os")) |os_value| {
-                var os_copy = try scope_mod.cloneJsonValue(allocator, os_value);
-                errdefer scope_mod.deinitJsonValueDeep(allocator, &os_copy);
-                try putOwnedJsonEntry(allocator, merged_object, "os", os_copy);
-            }
-        }
-
         return merged;
     }
 
