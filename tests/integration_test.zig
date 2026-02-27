@@ -633,7 +633,7 @@ test "CJM e2e: full flow captures event transaction log session and check-in" {
     try testing.expect(relay.containsInAny("\"environment\":\"production\""));
 }
 
-test "Rust parity e2e: event trace context comes from propagation context without active span" {
+test "Parity e2e: event trace context comes from propagation context without active span" {
     var relay = try CaptureRelay.init(testing.allocator, &.{});
     defer relay.deinit();
     try relay.start();
@@ -660,7 +660,7 @@ test "Rust parity e2e: event trace context comes from propagation context withou
     try testing.expect(relay.containsInAny("\"span_id\":\""));
 }
 
-test "Rust parity e2e: transaction envelope carries dynamic sampling trace header fields" {
+test "Parity e2e: transaction envelope carries dynamic sampling trace header fields" {
     var relay = try CaptureRelay.init(testing.allocator, &.{});
     defer relay.deinit();
     try relay.start();

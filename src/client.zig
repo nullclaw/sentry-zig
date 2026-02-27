@@ -1744,7 +1744,13 @@ pub const Client = struct {
     }
 
     fn sessionAggregateFlusherLoop(self: *Client) void {
-        const interval_ns: u64 = @max(1, @as(u64, @intCast(self.sessionAggregateFlushIntervalNs())));
+        const interval_ns_i128 = self.sessionAggregateFlushIntervalNs();
+        const interval_ns: u64 = if (interval_ns_i128 <= 0)
+            1
+        else if (interval_ns_i128 >= std.math.maxInt(u64))
+            std.math.maxInt(u64)
+        else
+            @as(u64, @intCast(interval_ns_i128));
 
         while (true) {
             self.session_flush_mutex.lock();
@@ -4389,6 +4395,29 @@ test "Client request session mode flushes aggregates on interval timer" {
     while (attempts < 60 and state.count.load(.seq_cst) == 0) : (attempts += 1) {
         std.Thread.sleep(10 * std.time.ns_per_ms);
     }
+
+    try testing.expect(state.count.load(.seq_cst) > 0);
+}
+
+test "Client request session mode accepts very large aggregate flush interval" {
+    var state = AtomicCountTransportState{};
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .release = "my-app@1.0.0",
+        .session_mode = .request,
+        .session_aggregate_flush_interval_ms = std.math.maxInt(u64),
+        .transport = .{
+            .send_fn = atomicCountTransportSendFn,
+            .ctx = &state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    client.startSession();
+    client.endSession(.exited);
+    _ = client.flush(1000);
 
     try testing.expect(state.count.load(.seq_cst) > 0);
 }
