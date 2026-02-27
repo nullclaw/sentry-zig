@@ -23,6 +23,12 @@ pub const PropagationHeader = struct {
     value: []const u8,
 };
 
+pub const ParsedPropagationHeaders = struct {
+    sentry_trace_header: ?[]const u8 = null,
+    baggage_header: ?[]const u8 = null,
+    traceparent_header: ?[]const u8 = null,
+};
+
 pub const DynamicSamplingContext = struct {
     trace_id: [32]u8,
     public_key: []const u8,
@@ -88,13 +94,30 @@ pub fn parseSentryTrace(header_value: []const u8) ?SentryTrace {
 }
 
 pub fn parseHeaders(headers: []const PropagationHeader) ?SentryTrace {
+    const parsed = parsePropagationHeaders(headers);
+    const sentry_trace = parsed.sentry_trace_header orelse return null;
+    return parseSentryTrace(sentry_trace);
+}
+
+/// Extract known incoming propagation headers (`sentry-trace`, `baggage`,
+/// and W3C `traceparent`) using case-insensitive lookup.
+pub fn parsePropagationHeaders(headers: []const PropagationHeader) ParsedPropagationHeaders {
+    var parsed: ParsedPropagationHeaders = .{};
     for (headers) |header| {
         const name = std.mem.trim(u8, header.name, " \t");
-        if (std.ascii.eqlIgnoreCase(name, "sentry-trace")) {
-            return parseSentryTrace(header.value);
+        if (parsed.sentry_trace_header == null and std.ascii.eqlIgnoreCase(name, "sentry-trace")) {
+            parsed.sentry_trace_header = header.value;
+            continue;
+        }
+        if (parsed.baggage_header == null and std.ascii.eqlIgnoreCase(name, "baggage")) {
+            parsed.baggage_header = header.value;
+            continue;
+        }
+        if (parsed.traceparent_header == null and std.ascii.eqlIgnoreCase(name, "traceparent")) {
+            parsed.traceparent_header = header.value;
         }
     }
-    return null;
+    return parsed;
 }
 
 /// Parse W3C `traceparent` header.
@@ -136,13 +159,9 @@ pub fn parseTraceParent(traceparent: []const u8) ?TraceParentContext {
 
 /// Find and parse `traceparent` from raw header list.
 pub fn parseTraceParentFromHeaders(headers: []const PropagationHeader) ?TraceParentContext {
-    for (headers) |header| {
-        const name = std.mem.trim(u8, header.name, " \t");
-        if (std.ascii.eqlIgnoreCase(name, "traceparent")) {
-            return parseTraceParent(header.value);
-        }
-    }
-    return null;
+    const parsed = parsePropagationHeaders(headers);
+    const traceparent = parsed.traceparent_header orelse return null;
+    return parseTraceParent(traceparent);
 }
 
 pub fn formatSentryTraceAlloc(allocator: Allocator, trace: SentryTrace) ![]u8 {
@@ -446,6 +465,24 @@ test "parseHeaders returns null for invalid sentry-trace value" {
         .{ .name = "sentry-trace", .value = "invalid" },
     };
     try testing.expect(parseHeaders(&headers) == null);
+}
+
+test "parsePropagationHeaders extracts known headers case-insensitively" {
+    const headers = [_]PropagationHeader{
+        .{ .name = "X-Test", .value = "1" },
+        .{ .name = "Sentry-Trace", .value = "0123456789abcdef0123456789abcdef-89abcdef01234567-1" },
+        .{ .name = "BAGGAGE", .value = "sentry-trace_id=0123456789abcdef0123456789abcdef" },
+        .{ .name = "TrAcEpArEnT", .value = "00-0123456789abcdef0123456789abcdef-89abcdef01234567-01" },
+    };
+    const parsed = parsePropagationHeaders(&headers);
+    try testing.expect(parsed.sentry_trace_header != null);
+    try testing.expect(parsed.baggage_header != null);
+    try testing.expect(parsed.traceparent_header != null);
+    try testing.expectEqualStrings(
+        "0123456789abcdef0123456789abcdef-89abcdef01234567-1",
+        parsed.sentry_trace_header.?,
+    );
+    try testing.expect(std.mem.startsWith(u8, parsed.traceparent_header.?, "00-"));
 }
 
 test "parseTraceParent parses valid header" {

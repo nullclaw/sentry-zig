@@ -905,24 +905,10 @@ pub const Client = struct {
         opts: TransactionOpts,
         headers: []const PropagationHeader,
     ) Transaction {
-        var sentry_trace_header: ?[]const u8 = null;
-        var traceparent_header: ?[]const u8 = null;
-        var baggage_header: ?[]const u8 = null;
-
-        for (headers) |header| {
-            const name = std.mem.trim(u8, header.name, " \t");
-            if (sentry_trace_header == null and std.ascii.eqlIgnoreCase(name, "sentry-trace")) {
-                sentry_trace_header = header.value;
-                continue;
-            }
-            if (traceparent_header == null and std.ascii.eqlIgnoreCase(name, "traceparent")) {
-                traceparent_header = header.value;
-                continue;
-            }
-            if (baggage_header == null and std.ascii.eqlIgnoreCase(name, "baggage")) {
-                baggage_header = header.value;
-            }
-        }
+        const parsed_headers = propagation.parsePropagationHeaders(headers);
+        const sentry_trace_header = parsed_headers.sentry_trace_header;
+        const traceparent_header = parsed_headers.traceparent_header;
+        const baggage_header = parsed_headers.baggage_header;
 
         if (sentry_trace_header) |sentry_trace| {
             if (self.startTransactionFromPropagationHeaders(

@@ -482,31 +482,12 @@ pub const IncomingRunOptions = struct {
     capture_errors: bool = true,
 };
 
-pub const IncomingPropagationHeaders = struct {
-    sentry_trace_header: ?[]const u8 = null,
-    baggage_header: ?[]const u8 = null,
-    traceparent_header: ?[]const u8 = null,
-};
+pub const IncomingPropagationHeaders = propagation.ParsedPropagationHeaders;
 
 /// Extract `sentry-trace` and `baggage` values from case-insensitive header
 /// list representation.
 pub fn extractIncomingPropagationHeaders(headers: []const PropagationHeader) IncomingPropagationHeaders {
-    var result: IncomingPropagationHeaders = .{};
-    for (headers) |header| {
-        const name = std.mem.trim(u8, header.name, " \t");
-        if (result.sentry_trace_header == null and std.ascii.eqlIgnoreCase(name, "sentry-trace")) {
-            result.sentry_trace_header = header.value;
-            continue;
-        }
-        if (result.baggage_header == null and std.ascii.eqlIgnoreCase(name, "baggage")) {
-            result.baggage_header = header.value;
-            continue;
-        }
-        if (result.traceparent_header == null and std.ascii.eqlIgnoreCase(name, "traceparent")) {
-            result.traceparent_header = header.value;
-        }
-    }
-    return result;
+    return propagation.parsePropagationHeaders(headers);
 }
 
 fn sentryTraceFromTraceParent(traceparent: []const u8, output: *[51]u8) ?[]const u8 {

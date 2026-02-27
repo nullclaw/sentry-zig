@@ -63,8 +63,10 @@ pub const DynamicSamplingContext = @import("propagation.zig").DynamicSamplingCon
 pub const ParsedBaggage = @import("propagation.zig").ParsedBaggage;
 pub const ParsedBaggageOwned = @import("propagation.zig").ParsedBaggageOwned;
 pub const PropagationHeader = @import("propagation.zig").PropagationHeader;
+pub const ParsedPropagationHeaders = @import("propagation.zig").ParsedPropagationHeaders;
 pub const parseSentryTrace = @import("propagation.zig").parseSentryTrace;
 pub const parseHeaders = @import("propagation.zig").parseHeaders;
+pub const parsePropagationHeaders = @import("propagation.zig").parsePropagationHeaders;
 pub const parseBaggage = @import("propagation.zig").parseBaggage;
 pub const parseBaggageAlloc = @import("propagation.zig").parseBaggageAlloc;
 pub const formatSentryTraceAlloc = @import("propagation.zig").formatSentryTraceAlloc;
@@ -575,6 +577,10 @@ test "global wrappers route through current hub" {
     defer continued_from_traceparent_headers.deinit();
     try std.testing.expectEqualStrings("fedcba9876543210fedcba9876543210", continued_from_traceparent_headers.trace_id[0..]);
     try std.testing.expectEqual(@as(?bool, false), continued_from_traceparent_headers.parent_sampled);
+
+    const parsed_propagation = parsePropagationHeaders(&traceparent_headers);
+    try std.testing.expect(parsed_propagation.sentry_trace_header == null);
+    try std.testing.expect(parsed_propagation.traceparent_header != null);
 
     var continued_from_span = startTransactionFromSpan(
         .{ .name = "GET /continued-global-span", .op = "http.server" },
