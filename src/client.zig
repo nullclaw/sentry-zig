@@ -1458,7 +1458,11 @@ pub const Client = struct {
         }
 
         if (std.mem.indexOf(u8, cursor, " as ")) |as_index| {
-            if (isAllWordChars(cursor[0..as_index])) {
+            const implementor = cursor[0..as_index];
+            if (std.mem.indexOf(u8, implementor, "::") == null and
+                std.mem.indexOf(u8, implementor, "..") == null and
+                std.mem.indexOfScalar(u8, implementor, '[') == null)
+            {
                 cursor = cursor[as_index + 4 ..];
             }
         }
@@ -1470,7 +1474,15 @@ pub const Client = struct {
         if (crate_len >= cursor.len) return null;
 
         if (cursor[crate_len] == '[') {
-            return cursor[0..crate_len];
+            const hash_end = crateHashEnd(cursor, crate_len) orelse return null;
+            if (hash_end + 1 < cursor.len) {
+                const a = cursor[hash_end];
+                const b = cursor[hash_end + 1];
+                if ((a == ':' and b == ':') or (a == '.' and b == '.')) {
+                    return cursor[0..crate_len];
+                }
+            }
+            return null;
         }
 
         if (crate_len + 1 < cursor.len) {
@@ -1488,12 +1500,21 @@ pub const Client = struct {
         return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_';
     }
 
-    fn isAllWordChars(text: []const u8) bool {
-        if (text.len == 0) return false;
-        for (text) |c| {
-            if (!isWordChar(c)) return false;
+    fn isHexChar(c: u8) bool {
+        return (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
+    }
+
+    fn crateHashEnd(text: []const u8, start: usize) ?usize {
+        if (start >= text.len or text[start] != '[') return null;
+        const hash_len: usize = 16;
+        if (start + 1 + hash_len >= text.len) return null;
+        var idx: usize = 0;
+        while (idx < hash_len) : (idx += 1) {
+            if (!isHexChar(text[start + 1 + idx])) return null;
         }
-        return true;
+        const end_bracket_index = start + 1 + hash_len;
+        if (text[end_bracket_index] != ']') return null;
+        return end_bracket_index + 1;
     }
 
     fn functionStartsWithRustPattern(function_name: []const u8, pattern_input: []const u8) bool {
@@ -1526,13 +1547,23 @@ pub const Client = struct {
             }
         }
 
-        if (func.len < pattern.len) return false;
+        var fi: usize = 0;
+        var pi: usize = 0;
+        while (pi < pattern.len) {
+            if (fi >= func.len) return false;
 
-        var idx: usize = 0;
-        while (idx < pattern.len) : (idx += 1) {
-            const fc = func[idx];
-            const pc = pattern[idx];
+            if (func[fi] == '[') {
+                if (crateHashEnd(func, fi)) |after_hash| {
+                    fi = after_hash;
+                    continue;
+                }
+            }
+
+            const fc = func[fi];
+            const pc = pattern[pi];
             if (!(fc == pc or (fc == '.' and pc == ':'))) return false;
+            fi += 1;
+            pi += 1;
         }
         return true;
     }
@@ -4067,7 +4098,12 @@ test "parsePackageFromFunction handles rust impl and crate hash formats" {
         "backtrace",
         Client.parsePackageFromFunction("backtrace[856cf81bbf211f65]::capture::Backtrace::new").?,
     );
+    try testing.expectEqualStrings(
+        "core",
+        Client.parsePackageFromFunction("<fn() as core[bb3d6b31f0e973c8]::ops::function::FnOnce<()>>::call_once").?,
+    );
     try testing.expect(Client.parsePackageFromFunction("main") == null);
+    try testing.expect(Client.parsePackageFromFunction("crate[short]::mod::f") == null);
 }
 
 test "functionStartsWithRustPattern handles impl-style symbol prefixes" {
@@ -4078,6 +4114,14 @@ test "functionStartsWithRustPattern handles impl-style symbol prefixes" {
     try testing.expect(Client.functionStartsWithRustPattern(
         "<futures::task_impl::Spawn<T>>::enter::{{closure}}",
         "<futures::",
+    ));
+    try testing.expect(Client.functionStartsWithRustPattern(
+        "backtrace[856cf81bbf211f65]::capture::Backtrace::new",
+        "backtrace::",
+    ));
+    try testing.expect(Client.functionStartsWithRustPattern(
+        "<F as alloc..boxed..FnBox<A>>::call_box",
+        "alloc::",
     ));
     try testing.expect(!Client.functionStartsWithRustPattern(
         "futures::task_impl::std::set",
