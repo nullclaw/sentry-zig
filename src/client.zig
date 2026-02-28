@@ -513,7 +513,11 @@ pub const Client = struct {
             prepared_event.threads = null;
         };
 
-        if (self.options.in_app_include != null or self.options.in_app_exclude != null) {
+        const should_process_stacktraces =
+            self.options.default_integrations or
+            self.options.in_app_include != null or
+            self.options.in_app_exclude != null;
+        if (should_process_stacktraces) {
             if (applyInAppFrameHints(
                 self.allocator,
                 prepared_event,
@@ -3761,6 +3765,52 @@ test "Client in_app fallback marks event stacktrace frames as true when unresolv
 
     try testing.expect(client.captureEventId(&event) != null);
     try testing.expectEqual(@as(?bool, true), before_send_first_event_stacktrace_frame_in_app);
+    try testing.expectEqual(@as(?bool, null), frames[0].in_app);
+}
+
+test "Client default integrations classify unresolved event stacktrace frames as in_app=true" {
+    before_send_first_event_stacktrace_frame_in_app = null;
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .default_integrations = true,
+        .before_send = inspectEventStacktraceInAppBeforeSend,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    const frames = [_]Frame{.{
+        .module = "vendor.lib.runtime",
+        .function = "dispatch",
+    }};
+    var event = Event.initMessage("event-stacktrace-default-integrations", .info);
+    event.stacktrace = .{ .frames = &frames };
+
+    try testing.expect(client.captureEventId(&event) != null);
+    try testing.expectEqual(@as(?bool, true), before_send_first_event_stacktrace_frame_in_app);
+    try testing.expectEqual(@as(?bool, null), frames[0].in_app);
+}
+
+test "Client default_integrations=false keeps unresolved event stacktrace frames unchanged without in_app patterns" {
+    before_send_first_event_stacktrace_frame_in_app = null;
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .default_integrations = false,
+        .before_send = inspectEventStacktraceInAppBeforeSend,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    const frames = [_]Frame{.{
+        .module = "vendor.lib.runtime",
+        .function = "dispatch",
+    }};
+    var event = Event.initMessage("event-stacktrace-no-default-integrations", .info);
+    event.stacktrace = .{ .frames = &frames };
+
+    try testing.expect(client.captureEventId(&event) != null);
+    try testing.expectEqual(@as(?bool, null), before_send_first_event_stacktrace_frame_in_app);
     try testing.expectEqual(@as(?bool, null), frames[0].in_app);
 }
 
