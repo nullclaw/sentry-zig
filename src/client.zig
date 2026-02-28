@@ -1448,9 +1448,93 @@ pub const Client = struct {
     }
 
     fn parsePackageFromFunction(function: []const u8) ?[]const u8 {
-        const separator = std.mem.indexOf(u8, function, "::") orelse return null;
-        if (separator == 0) return null;
-        return function[0..separator];
+        var cursor = function;
+        if (cursor.len == 0) return null;
+
+        if (std.mem.startsWith(u8, cursor, "_<")) {
+            cursor = cursor[2..];
+        } else if (std.mem.startsWith(u8, cursor, "<")) {
+            cursor = cursor[1..];
+        }
+
+        if (std.mem.indexOf(u8, cursor, " as ")) |as_index| {
+            if (isAllWordChars(cursor[0..as_index])) {
+                cursor = cursor[as_index + 4 ..];
+            }
+        }
+
+        var crate_len: usize = 0;
+        while (crate_len < cursor.len and isWordChar(cursor[crate_len])) : (crate_len += 1) {}
+        if (crate_len == 0) return null;
+
+        if (crate_len >= cursor.len) return null;
+
+        if (cursor[crate_len] == '[') {
+            return cursor[0..crate_len];
+        }
+
+        if (crate_len + 1 < cursor.len) {
+            const a = cursor[crate_len];
+            const b = cursor[crate_len + 1];
+            if ((a == ':' and b == ':') or (a == '.' and b == '.')) {
+                return cursor[0..crate_len];
+            }
+        }
+
+        return null;
+    }
+
+    fn isWordChar(c: u8) bool {
+        return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_';
+    }
+
+    fn isAllWordChars(text: []const u8) bool {
+        if (text.len == 0) return false;
+        for (text) |c| {
+            if (!isWordChar(c)) return false;
+        }
+        return true;
+    }
+
+    fn functionStartsWithRustPattern(function_name: []const u8, pattern_input: []const u8) bool {
+        var func = function_name;
+        var pattern = pattern_input;
+        if (pattern.len == 0) return false;
+
+        if (pattern[0] == '<') {
+            while (pattern.len > 0 and pattern[0] == '<') {
+                pattern = pattern[1..];
+                if (std.mem.startsWith(u8, func, "<F as ")) {
+                    func = func[6..];
+                } else if (std.mem.startsWith(u8, func, "<")) {
+                    func = func[1..];
+                } else if (std.mem.startsWith(u8, func, "_<")) {
+                    func = func[2..];
+                } else {
+                    return false;
+                }
+            }
+        } else {
+            if (std.mem.startsWith(u8, func, "<F as ")) {
+                func = func[6..];
+            }
+            if (std.mem.startsWith(u8, func, "<")) {
+                func = func[1..];
+            }
+            if (std.mem.startsWith(u8, func, "_<")) {
+                func = func[2..];
+            }
+        }
+
+        if (func.len < pattern.len) return false;
+
+        var idx: usize = 0;
+        while (idx < pattern.len) : (idx += 1) {
+            const fc = func[idx];
+            const pc = pattern[idx];
+            if (!(fc == pc or (fc == '.' and pc == ':'))) return false;
+        }
+        return true;
     }
 
     fn ensureFramePackageFromFunction(frame: *Frame) bool {
@@ -1519,7 +1603,7 @@ pub const Client = struct {
     fn isWellKnownNotInApp(frame: Frame) bool {
         const function = frame.function orelse return false;
         for (well_known_not_in_app_prefixes) |prefix| {
-            if (std.mem.startsWith(u8, function, prefix)) return true;
+            if (functionStartsWithRustPattern(function, prefix)) return true;
         }
         return false;
     }
@@ -3968,6 +4052,37 @@ test "Client default integrations derive event stacktrace frame package from fun
     try testing.expect(client.captureEventId(&event) != null);
     try testing.expect(before_send_event_stacktrace_frame_package_matches_expected);
     try testing.expectEqual(@as(?[]const u8, null), frames[0].package);
+}
+
+test "parsePackageFromFunction handles rust impl and crate hash formats" {
+    try testing.expectEqualStrings(
+        "futures",
+        Client.parsePackageFromFunction("_<futures..task_impl..Spawn<T>>::enter::_{{closure}}").?,
+    );
+    try testing.expectEqualStrings(
+        "failure",
+        Client.parsePackageFromFunction("<failure::error::Error as core::convert::From<F>>::from").?,
+    );
+    try testing.expectEqualStrings(
+        "backtrace",
+        Client.parsePackageFromFunction("backtrace[856cf81bbf211f65]::capture::Backtrace::new").?,
+    );
+    try testing.expect(Client.parsePackageFromFunction("main") == null);
+}
+
+test "functionStartsWithRustPattern handles impl-style symbol prefixes" {
+    try testing.expect(Client.functionStartsWithRustPattern(
+        "_<futures..task_impl..Spawn<T>>::enter::_{{closure}}",
+        "futures::",
+    ));
+    try testing.expect(Client.functionStartsWithRustPattern(
+        "<futures::task_impl::Spawn<T>>::enter::{{closure}}",
+        "<futures::",
+    ));
+    try testing.expect(!Client.functionStartsWithRustPattern(
+        "futures::task_impl::std::set",
+        "tokio::",
+    ));
 }
 
 test "Client in_app fallback marks event stacktrace frames as true when unresolved" {

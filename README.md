@@ -739,7 +739,7 @@ When `server_name` is unset and `default_integrations = true`, the SDK attempts 
 `in_app_include`/`in_app_exclude` are applied to event, exception, and thread stack frames.
 With `default_integrations=true`, stacktrace frames are also classified even without explicit in-app patterns.
 Well-known runtime/library function prefixes (for example `std::`, `core::`, `tokio::`) are classified as `in_app=false`.
-When a frame has `function` but no `package`, package is derived from the function prefix before `::`.
+When a frame has `function` but no `package`, package is derived from Rust-style symbol prefixes (`crate::`, `crate..`, `crate[hash]::`, impl-style symbols).
 When no frame is marked `in_app=true`, frames with missing `in_app` are treated as `true`.
 `attach_debug_images=true` injects default `debug_meta.images` metadata for events that do not already include debug image info.
 `accept_invalid_certs=true` is intended for local/dev environments and is not supported together with explicit proxy transport.

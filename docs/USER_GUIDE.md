@@ -949,8 +949,9 @@ With `default_integrations=true`, stacktrace frames are also classified even
 without explicit include/exclude patterns.
 Well-known runtime/library function prefixes (for example `std::`, `core::`,
 `tokio::`) are classified as `in_app=false`.
-When a frame has `function` but no `package`, package is derived from the
-function prefix before `::`.
+When a frame has `function` but no `package`, package is derived from
+Rust-style symbol prefixes (`crate::`, `crate..`, `crate[hash]::`,
+impl-style symbols).
 If no frame in a stacktrace is marked `in_app=true`, frames without explicit
 `in_app` are treated as `true`.
 For transaction envelopes, the SDK adds a dynamic trace header
