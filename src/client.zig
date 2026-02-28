@@ -1924,6 +1924,19 @@ pub const Client = struct {
             env_map,
             &.{ "HTTPS_PROXY", "https_proxy" },
         );
+        if (options.https_proxy == null and options.http_proxy != null) {
+            if (owned.http_proxy) |http_proxy_owned| {
+                const copied = try allocator.dupe(u8, http_proxy_owned);
+                options.https_proxy = copied;
+                owned.https_proxy = copied;
+            } else {
+                options.https_proxy = options.http_proxy;
+            }
+        }
+
+        if (options.environment == null) {
+            options.environment = defaultEnvironmentName();
+        }
 
         if (!options.debug) {
             if (env_map.get("SENTRY_DEBUG")) |value| {
@@ -2026,6 +2039,13 @@ pub const Client = struct {
         if (std.ascii.eqlIgnoreCase(trimmed, "no")) return false;
         if (std.ascii.eqlIgnoreCase(trimmed, "off")) return false;
         return null;
+    }
+
+    fn defaultEnvironmentName() []const u8 {
+        return switch (builtin.mode) {
+            .Debug => "development",
+            else => "production",
+        };
     }
 
     fn detectServerNameAlloc(allocator: Allocator) ?[]u8 {
@@ -2198,6 +2218,27 @@ test "Client initInternal accepts DSN from environment map when dsn is blank" {
     defer client.deinit();
 
     try testing.expectEqualStrings("env-release@1.0.0", client.options.release.?);
+    try testing.expectEqualStrings(Client.defaultEnvironmentName(), client.options.environment.?);
+}
+
+test "applyEnvDefaultsFromMap sets default environment and https_proxy fallback from http_proxy" {
+    var env_map = std.process.EnvMap.init(testing.allocator);
+    defer env_map.deinit();
+
+    try env_map.put("HTTP_PROXY", "http://proxy.example.com:8080");
+
+    var opts = Options{
+        .dsn = "https://explicitPublicKey@o0.ingest.sentry.io/1234567",
+        .install_signal_handlers = false,
+    };
+    var owned: OwnedOptionStrings = .{};
+    defer owned.deinit(testing.allocator);
+
+    try Client.applyEnvDefaultsFromMap(testing.allocator, &opts, &owned, &env_map);
+
+    try testing.expectEqualStrings(Client.defaultEnvironmentName(), opts.environment.?);
+    try testing.expectEqualStrings("http://proxy.example.com:8080", opts.http_proxy.?);
+    try testing.expectEqualStrings("http://proxy.example.com:8080", opts.https_proxy.?);
 }
 
 test "Client struct size is non-zero" {

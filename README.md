@@ -732,6 +732,13 @@ When `server_name` is unset and `default_integrations = true`, the SDK attempts 
 - `HTTPS_PROXY` / `https_proxy`
 - `SSL_VERIFY` (`false` enables `accept_invalid_certs`)
 
+When no explicit `environment` and no `SENTRY_ENVIRONMENT` are provided,
+env-default initialization sets:
+- `"development"` for debug builds
+- `"production"` for non-debug builds
+
+When `HTTPS_PROXY` is missing but `HTTP_PROXY` is available, HTTPS proxy defaults to HTTP proxy.
+
 Example integration setup callback:
 
 ```zig

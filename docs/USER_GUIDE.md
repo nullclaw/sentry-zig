@@ -647,6 +647,12 @@ If `Options.integrations` is provided, each integration setup callback runs duri
 - `HTTPS_PROXY` / `https_proxy`
 - `SSL_VERIFY` (`false` enables `accept_invalid_certs`)
 
+If `environment` is still missing after env resolution, env-default init sets:
+- `"development"` for debug builds
+- `"production"` for non-debug builds
+
+If `HTTPS_PROXY` is missing and `HTTP_PROXY` is configured, HTTPS proxy uses HTTP proxy value.
+
 ```zig
 fn setupIntegration(client: *sentry.Client, _: ?*anyopaque) void {
     client.setTag("integration", "checkout");
