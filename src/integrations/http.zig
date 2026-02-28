@@ -896,7 +896,7 @@ test "RequestContext begin/finish captures transaction with propagated trace and
     for (payload_state.payloads.items) |payload| {
         if (std.mem.indexOf(u8, payload, "\"type\":\"transaction\"") != null) {
             saw_transaction = true;
-            try testing.expect(std.mem.indexOf(u8, payload, "\"name\":\"GET /orders/:id\"") != null);
+            try testing.expect(std.mem.indexOf(u8, payload, "\"transaction\":\"GET /orders/:id\"") != null);
             try testing.expect(std.mem.indexOf(u8, payload, "\"op\":\"http.server\"") != null);
             try testing.expect(std.mem.indexOf(u8, payload, "\"status\":\"not_found\"") != null);
             try testing.expect(std.mem.indexOf(u8, payload, "\"method\":\"GET\"") != null);
@@ -1273,7 +1273,7 @@ test "runIncomingRequest auto-finishes transaction and captures handler data" {
     for (payload_state.payloads.items) |payload| {
         if (std.mem.indexOf(u8, payload, "\"type\":\"transaction\"") != null) {
             saw_transaction = true;
-            try testing.expect(std.mem.indexOf(u8, payload, "\"name\":\"GET /pipeline\"") != null);
+            try testing.expect(std.mem.indexOf(u8, payload, "\"transaction\":\"GET /pipeline\"") != null);
             try testing.expect(std.mem.indexOf(u8, payload, "\"status_code\":204") != null);
             try testing.expect(std.mem.indexOf(u8, payload, "\"handler\":\"incoming-success\"") != null);
         }
@@ -1319,7 +1319,7 @@ test "runIncomingRequestTyped validates typed context and captures handler data"
     for (payload_state.payloads.items) |payload| {
         if (std.mem.indexOf(u8, payload, "\"type\":\"transaction\"") != null) {
             saw_transaction = true;
-            try testing.expect(std.mem.indexOf(u8, payload, "\"name\":\"GET /pipeline-typed\"") != null);
+            try testing.expect(std.mem.indexOf(u8, payload, "\"transaction\":\"GET /pipeline-typed\"") != null);
             try testing.expect(std.mem.indexOf(u8, payload, "\"status_code\":206") != null);
             try testing.expect(std.mem.indexOf(u8, payload, "\"handler\":\"incoming-typed\"") != null);
         }

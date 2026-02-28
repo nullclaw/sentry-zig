@@ -56,7 +56,9 @@ pub fn initWithDefaults(allocator: std.mem.Allocator, options: Options) !*Client
     var merged: std.ArrayListUnmanaged(Integration) = .{};
     defer merged.deinit(allocator);
 
-    try merged.appendSlice(allocator, defaults());
+    if (options.default_integrations) {
+        try merged.appendSlice(allocator, defaults());
+    }
     if (options.integrations) |user_integrations| {
         try merged.appendSlice(allocator, user_integrations);
     }
@@ -71,7 +73,9 @@ pub fn initWithDefaultsFromEnv(allocator: std.mem.Allocator, options: Options) !
     var merged: std.ArrayListUnmanaged(Integration) = .{};
     defer merged.deinit(allocator);
 
-    try merged.appendSlice(allocator, defaults());
+    if (options.default_integrations) {
+        try merged.appendSlice(allocator, defaults());
+    }
     if (options.integrations) |user_integrations| {
         try merged.appendSlice(allocator, user_integrations);
     }
@@ -167,7 +171,9 @@ pub fn initWithDefaultsAndRuntime(
     runtime_options: RuntimeInstallOptions,
 ) !*Client {
     installRuntime(runtime_options);
-    return initWithDefaults(allocator, options);
+    const client = try initWithDefaults(allocator, options);
+    installRuntime(runtime_options);
+    return client;
 }
 
 /// Install runtime config and initialize client with default integrations and env defaults.
@@ -177,7 +183,9 @@ pub fn initWithDefaultsAndRuntimeFromEnv(
     runtime_options: RuntimeInstallOptions,
 ) !*Client {
     installRuntime(runtime_options);
-    return initWithDefaultsFromEnv(allocator, options);
+    const client = try initWithDefaultsFromEnv(allocator, options);
+    installRuntime(runtime_options);
+    return client;
 }
 
 /// Install runtime config and initialize global hub with default integrations.
@@ -187,7 +195,9 @@ pub fn initGlobalWithDefaultsAndRuntime(
     runtime_options: RuntimeInstallOptions,
 ) !InitGuard {
     installRuntime(runtime_options);
-    return initGlobalWithDefaults(allocator, options);
+    const guard = try initGlobalWithDefaults(allocator, options);
+    installRuntime(runtime_options);
+    return guard;
 }
 
 /// Install runtime config and initialize global hub with default integrations and env defaults.
@@ -197,7 +207,9 @@ pub fn initGlobalWithDefaultsAndRuntimeFromEnv(
     runtime_options: RuntimeInstallOptions,
 ) !InitGuard {
     installRuntime(runtime_options);
-    return initGlobalWithDefaultsFromEnv(allocator, options);
+    const guard = try initGlobalWithDefaultsFromEnv(allocator, options);
+    installRuntime(runtime_options);
+    return guard;
 }
 
 /// Run incoming HTTP handler using client from current hub.
@@ -409,6 +421,36 @@ test "initWithDefaults prepends built-ins and keeps user integration callbacks" 
     try testing.expect(lookup_received_null);
 }
 
+test "initWithDefaults honors default_integrations=false" {
+    var called = false;
+    const integration = Integration{
+        .setup = testUserIntegrationSetup,
+        .ctx = &called,
+    };
+
+    const client = try initWithDefaults(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .default_integrations = false,
+        .integrations = &.{integration},
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    try testing.expect(called);
+
+    lookup_called = false;
+    lookup_received_null = false;
+    try testing.expect(!client.withIntegration(log.setup, inspectLookup));
+    try testing.expect(lookup_called);
+    try testing.expect(lookup_received_null);
+
+    lookup_called = false;
+    lookup_received_null = false;
+    try testing.expect(!client.withIntegration(panic_integration.setup, inspectLookup));
+    try testing.expect(lookup_called);
+    try testing.expect(lookup_received_null);
+}
+
 test "initGlobalWithDefaults binds and restores TLS hub" {
     try testing.expect(Hub.current() == null);
 
@@ -532,7 +574,7 @@ test "runIncomingRequestWithCurrentHub uses current hub client" {
     for (payload_state.payloads.items) |payload| {
         if (std.mem.indexOf(u8, payload, "\"type\":\"transaction\"") == null) continue;
         saw_transaction = true;
-        try testing.expect(std.mem.indexOf(u8, payload, "\"name\":\"GET /auto/current\"") != null);
+        try testing.expect(std.mem.indexOf(u8, payload, "\"transaction\":\"GET /auto/current\"") != null);
         try testing.expect(std.mem.indexOf(u8, payload, "\"op\":\"http.server\"") != null);
         try testing.expect(std.mem.indexOf(u8, payload, "\"status\":\"ok\"") != null);
     }

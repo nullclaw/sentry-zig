@@ -131,6 +131,13 @@ pub fn initWithEnvDefaults(allocator: std.mem.Allocator, options: Options) !*Cli
     return Client.initWithEnvDefaults(allocator, options);
 }
 
+/// Initialize a new Sentry client with built-in integration defaults and env defaults.
+///
+/// This prepends built-in integration setup callbacks before user integrations.
+pub fn initWithDefaults(allocator: std.mem.Allocator, options: Options) !*Client {
+    return integrations.auto.initWithDefaultsFromEnv(allocator, options);
+}
+
 /// Initialize a new client, create a Hub, and bind it as the current thread-local Hub.
 ///
 /// Deinitialize the returned guard to restore the previous Hub and release resources.
@@ -156,6 +163,26 @@ pub fn initGlobal(allocator: std.mem.Allocator, options: Options) !InitGuard {
 /// Same as `initGlobal`, but fills missing options from environment variables first.
 pub fn initGlobalWithEnvDefaults(allocator: std.mem.Allocator, options: Options) !InitGuard {
     const client = try initWithEnvDefaults(allocator, options);
+    errdefer client.deinit();
+
+    const hub = try allocator.create(Hub);
+    errdefer allocator.destroy(hub);
+
+    hub.* = try Hub.init(allocator, client);
+    errdefer hub.deinit();
+
+    const previous_hub = Hub.setCurrent(hub);
+    return .{
+        .allocator = allocator,
+        .client = client,
+        .hub = hub,
+        .previous_hub = previous_hub,
+    };
+}
+
+/// Same as `initGlobal`, but also prepends built-in integrations and applies env defaults.
+pub fn initGlobalWithDefaults(allocator: std.mem.Allocator, options: Options) !InitGuard {
+    const client = try initWithDefaults(allocator, options);
     errdefer client.deinit();
 
     const hub = try allocator.create(Hub);
@@ -637,6 +664,47 @@ test "initGlobal binds current hub and clears it on deinit" {
     try std.testing.expect(currentHub() != null);
     try std.testing.expect(currentHub().? == guard.hubPtr());
     try std.testing.expect(captureMessage("init-global-message", .info) != null);
+
+    guard.deinit();
+    try std.testing.expect(currentHub() == null);
+}
+
+test "initWithDefaults keeps user integrations and supports default_integrations=false" {
+    var integration_flag = false;
+    const integration = Integration{
+        .setup = testGlobalIntegrationSetup,
+        .ctx = &integration_flag,
+    };
+
+    const client = try initWithDefaults(std.testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .default_integrations = false,
+        .integrations = &.{integration},
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    try std.testing.expect(integration_flag);
+    global_integration_lookup_called = false;
+    global_integration_lookup_received_null = true;
+    global_integration_lookup_flag_value = null;
+    try std.testing.expect(client.withIntegration(testGlobalIntegrationSetup, inspectGlobalIntegrationLookup));
+    try std.testing.expect(global_integration_lookup_called);
+    try std.testing.expect(!global_integration_lookup_received_null);
+    try std.testing.expectEqual(@as(?bool, true), global_integration_lookup_flag_value);
+}
+
+test "initGlobalWithDefaults binds current hub and restores previous" {
+    try std.testing.expect(currentHub() == null);
+
+    var guard = try initGlobalWithDefaults(std.testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .default_integrations = false,
+        .install_signal_handlers = false,
+    });
+    try std.testing.expect(currentHub() != null);
+    try std.testing.expect(currentHub().? == guard.hubPtr());
+    try std.testing.expect(captureMessage("init-global-defaults", .info) != null);
 
     guard.deinit();
     try std.testing.expect(currentHub() == null);

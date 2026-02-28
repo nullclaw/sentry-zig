@@ -315,6 +315,27 @@ defer client.deinit();
 ```
 
 ```zig
+// One-call defaults bootstrap: built-in integrations + env defaults.
+const client = try sentry.initWithDefaults(allocator, .{
+    .dsn = "https://PUBLIC_KEY@o0.ingest.sentry.io/PROJECT_ID",
+    .install_signal_handlers = false,
+});
+defer client.deinit();
+```
+
+```zig
+// Global one-call defaults bootstrap: binds current hub + built-in integrations + env defaults.
+var guard = try sentry.initGlobalWithDefaults(allocator, .{
+    .dsn = "https://PUBLIC_KEY@o0.ingest.sentry.io/PROJECT_ID",
+    .install_signal_handlers = false,
+});
+defer guard.deinit();
+```
+
+`initWithDefaults` and `initGlobalWithDefaults` honor `default_integrations=false`
+and keep user integration order after the optional built-ins.
+
+```zig
 // One-line built-in setup preset for Options.integrations
 const client = try sentry.init(allocator, .{
     .dsn = "https://PUBLIC_KEY@o0.ingest.sentry.io/PROJECT_ID",

@@ -173,6 +173,28 @@ var guard = try sentry.initGlobalWithEnvDefaults(allocator, .{
 defer guard.deinit();
 ```
 
+Defaults helper variant (built-ins + env defaults):
+
+```zig
+const client = try sentry.initWithDefaults(allocator, .{
+    .dsn = "https://PUBLIC_KEY@o0.ingest.sentry.io/PROJECT_ID",
+    .install_signal_handlers = false,
+});
+defer client.deinit();
+```
+
+Global defaults helper variant:
+
+```zig
+var guard = try sentry.initGlobalWithDefaults(allocator, .{
+    .dsn = "https://PUBLIC_KEY@o0.ingest.sentry.io/PROJECT_ID",
+    .install_signal_handlers = false,
+});
+defer guard.deinit();
+```
+
+Both defaults helpers honor `default_integrations=false`.
+
 ### std.log integration helper
 
 Set a custom `std_options.logFn` in your app root and install integration config:
