@@ -625,7 +625,7 @@ All options are provided via `sentry.Options` in `sentry.init`.
 | `traces_sample_rate` | `f64` | `0.0` | Trace sampling (`0.0..1.0`) |
 | `traces_sampler` | `?TracesSampler` | `null` | Per-transaction sampling callback |
 | `max_breadcrumbs` | `u32` | `100` | Scope breadcrumb cap |
-| `attach_stacktrace` | `bool` | `false` | Attach synthetic thread stacktrace payload when event has no threads |
+| `attach_stacktrace` | `bool` | `false` | Attach current-thread stacktrace payload (with safe fallback) when event has no threads |
 | `attach_debug_images` | `bool` | `true` | Attach default `debug_meta.images` payload when event has no debug image metadata |
 | `send_default_pii` | `bool` | `false` | Reserved option for explicit PII policy toggles |
 | `in_app_include` | `?[]const []const u8` | `null` | Optional in-app include patterns for stack frame classification |

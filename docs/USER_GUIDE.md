@@ -928,8 +928,9 @@ const client = try sentry.init(allocator, .{
 });
 ```
 
-With `attach_stacktrace=true`, the SDK adds thread stacktrace payload for events
-where `threads` are not already populated.
+With `attach_stacktrace=true`, the SDK adds current-thread stacktrace payload
+for events where `threads` are not already populated (with fallback when
+platform stack iteration is unavailable).
 
 ### attach_debug_images
 

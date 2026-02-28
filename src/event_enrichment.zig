@@ -20,6 +20,89 @@ pub fn ensureDefaultTraceContexts(
 }
 
 pub fn buildSyntheticThreads(allocator: Allocator) !json.Value {
+    if (try buildCapturedThreads(allocator)) |captured| {
+        return captured;
+    }
+    return buildFallbackSyntheticThreads(allocator);
+}
+
+fn buildCapturedThreads(allocator: Allocator) !?json.Value {
+    var iterator = std.debug.StackIterator.init(@returnAddress(), null);
+    defer iterator.deinit();
+
+    var frames_array = json.Array.init(allocator);
+    var frames_moved = false;
+    errdefer if (!frames_moved) {
+        var value: json.Value = .{ .array = frames_array };
+        scope_mod.deinitJsonValueDeep(allocator, &value);
+    };
+
+    var frame_count: usize = 0;
+    while (frame_count < 32) {
+        const address = iterator.next() orelse break;
+        var frame_object = json.ObjectMap.init(allocator);
+        var frame_moved = false;
+        errdefer if (!frame_moved) {
+            var value: json.Value = .{ .object = frame_object };
+            scope_mod.deinitJsonValueDeep(allocator, &value);
+        };
+
+        var address_buffer: [2 + (@sizeOf(usize) * 2)]u8 = undefined;
+        const instruction_addr = std.fmt.bufPrint(&address_buffer, "0x{x}", .{address}) catch continue;
+        try putOwnedString(allocator, &frame_object, "instruction_addr", instruction_addr);
+        try putOwnedBool(allocator, &frame_object, "in_app", true);
+
+        try frames_array.append(.{ .object = frame_object });
+        frame_moved = true;
+        frame_count += 1;
+    }
+
+    if (frame_count == 0) {
+        var no_frames: json.Value = .{ .array = frames_array };
+        scope_mod.deinitJsonValueDeep(allocator, &no_frames);
+        return null;
+    }
+
+    var stacktrace_object = json.ObjectMap.init(allocator);
+    var stacktrace_moved = false;
+    errdefer if (!stacktrace_moved) {
+        var value: json.Value = .{ .object = stacktrace_object };
+        scope_mod.deinitJsonValueDeep(allocator, &value);
+    };
+    try putOwnedJsonEntry(allocator, &stacktrace_object, "frames", .{ .array = frames_array });
+    frames_moved = true;
+
+    var thread_object = json.ObjectMap.init(allocator);
+    var thread_moved = false;
+    errdefer if (!thread_moved) {
+        var value: json.Value = .{ .object = thread_object };
+        scope_mod.deinitJsonValueDeep(allocator, &value);
+    };
+    try putOwnedBool(allocator, &thread_object, "current", true);
+    try putOwnedJsonEntry(allocator, &thread_object, "stacktrace", .{ .object = stacktrace_object });
+    stacktrace_moved = true;
+
+    var threads_array = json.Array.init(allocator);
+    var threads_array_moved = false;
+    errdefer if (!threads_array_moved) {
+        var value: json.Value = .{ .array = threads_array };
+        scope_mod.deinitJsonValueDeep(allocator, &value);
+    };
+    try threads_array.append(.{ .object = thread_object });
+    thread_moved = true;
+
+    var threads_object = json.ObjectMap.init(allocator);
+    errdefer {
+        var value: json.Value = .{ .object = threads_object };
+        scope_mod.deinitJsonValueDeep(allocator, &value);
+    }
+    try putOwnedJsonEntry(allocator, &threads_object, "values", .{ .array = threads_array });
+    threads_array_moved = true;
+
+    return .{ .object = threads_object };
+}
+
+fn buildFallbackSyntheticThreads(allocator: Allocator) !json.Value {
     var frame_object = json.ObjectMap.init(allocator);
     var frame_moved = false;
     errdefer if (!frame_moved) {
@@ -365,7 +448,7 @@ test "ensureDefaultTraceContexts returns null when defaults already present" {
     try testing.expect(enriched == null);
 }
 
-test "buildSyntheticThreads produces one current thread with capture_event frame" {
+test "buildSyntheticThreads produces one current thread with non-empty frame" {
     var threads = try buildSyntheticThreads(testing.allocator);
     defer scope_mod.deinitJsonValueDeep(testing.allocator, &threads);
 
@@ -382,10 +465,21 @@ test "buildSyntheticThreads produces one current thread with capture_event frame
     try testing.expect(stacktrace == .object);
     const frames = stacktrace.object.get("frames") orelse return error.TestUnexpectedResult;
     try testing.expect(frames == .array);
-    try testing.expectEqual(@as(usize, 1), frames.array.items.len);
+    try testing.expect(frames.array.items.len >= 1);
 
     const frame = frames.array.items[0];
     try testing.expect(frame == .object);
-    try testing.expectEqualStrings("capture_event", frame.object.get("function").?.string);
+
+    const function_value = frame.object.get("function");
+    const instruction_value = frame.object.get("instruction_addr");
+    try testing.expect(function_value != null or instruction_value != null);
+    if (function_value) |value| {
+        try testing.expect(value == .string);
+        try testing.expectEqualStrings("capture_event", value.string);
+    }
+    if (instruction_value) |value| {
+        try testing.expect(value == .string);
+        try testing.expect(std.mem.startsWith(u8, value.string, "0x"));
+    }
     try testing.expect(frame.object.get("in_app").?.bool);
 }
