@@ -501,6 +501,12 @@ pub const Client = struct {
             prepared_event.exception = null;
         };
 
+        var owned_in_app_threads: ?json.Value = null;
+        defer if (owned_in_app_threads) |*threads| {
+            scope_mod.deinitJsonValueDeep(self.allocator, threads);
+            prepared_event.threads = null;
+        };
+
         if (self.options.in_app_include != null or self.options.in_app_exclude != null) {
             if (applyInAppFrameHints(
                 self.allocator,
@@ -509,6 +515,15 @@ pub const Client = struct {
                 self.options.in_app_exclude,
             ) catch null) |ownership| {
                 owned_exception_frames = ownership;
+            }
+            if (applyInAppThreadFrameHints(
+                self.allocator,
+                prepared_event,
+                self.options.in_app_include,
+                self.options.in_app_exclude,
+            ) catch null) |threads| {
+                prepared_event.threads = threads;
+                owned_in_app_threads = threads;
             }
         }
 
@@ -1237,6 +1252,81 @@ pub const Client = struct {
             .allocator = allocator,
             .values = values_copy,
             .frames_per_value = frames_per_value,
+        };
+    }
+
+    fn applyInAppThreadFrameHints(
+        allocator: Allocator,
+        event: *Event,
+        in_app_include: ?[]const []const u8,
+        in_app_exclude: ?[]const []const u8,
+    ) !?json.Value {
+        const threads = event.threads orelse return null;
+        if (threads != .object) return null;
+
+        const existing_values = threads.object.get("values") orelse return null;
+        if (existing_values != .array) return null;
+
+        var copied = try scope_mod.cloneJsonValue(allocator, threads);
+        errdefer scope_mod.deinitJsonValueDeep(allocator, &copied);
+        if (copied != .object) return null;
+
+        const values_ptr = copied.object.getPtr("values") orelse return null;
+        if (values_ptr.* != .array) return null;
+
+        var any_modified = false;
+        for (values_ptr.array.items) |*thread_value| {
+            if (thread_value.* != .object) continue;
+            const stacktrace_ptr = thread_value.object.getPtr("stacktrace") orelse continue;
+            if (stacktrace_ptr.* != .object) continue;
+            const frames_ptr = stacktrace_ptr.object.getPtr("frames") orelse continue;
+            if (frames_ptr.* != .array) continue;
+
+            for (frames_ptr.array.items) |*frame_value| {
+                if (frame_value.* != .object) continue;
+
+                const existing_in_app = frame_value.object.getPtr("in_app");
+                if (existing_in_app) |in_app_ptr| {
+                    if (in_app_ptr.* != .null) continue;
+                }
+
+                if (inferInAppFromThreadFrame(&frame_value.object, in_app_include, in_app_exclude)) |in_app| {
+                    if (existing_in_app) |in_app_ptr| {
+                        in_app_ptr.* = .{ .bool = in_app };
+                    } else {
+                        try putOwnedJsonEntry(allocator, &frame_value.object, "in_app", .{ .bool = in_app });
+                    }
+                    any_modified = true;
+                }
+            }
+        }
+
+        if (!any_modified) {
+            scope_mod.deinitJsonValueDeep(allocator, &copied);
+            return null;
+        }
+        return copied;
+    }
+
+    fn inferInAppFromThreadFrame(
+        frame_object: *const json.ObjectMap,
+        in_app_include: ?[]const []const u8,
+        in_app_exclude: ?[]const []const u8,
+    ) ?bool {
+        const frame = Frame{
+            .filename = jsonStringField(frame_object.get("filename")),
+            .function = jsonStringField(frame_object.get("function")),
+            .module = jsonStringField(frame_object.get("module")),
+            .abs_path = jsonStringField(frame_object.get("abs_path")),
+        };
+        return inferInApp(frame, in_app_include, in_app_exclude);
+    }
+
+    fn jsonStringField(value: ?json.Value) ?[]const u8 {
+        const candidate = value orelse return null;
+        return switch (candidate) {
+            .string => |str| str,
+            else => null,
         };
     }
 
@@ -2715,6 +2805,29 @@ fn hasThreadStacktrace(event: *const Event) bool {
     return false;
 }
 
+fn firstThreadFrameInApp(event: *const Event) ?bool {
+    const threads = event.threads orelse return null;
+    if (threads != .object) return null;
+
+    const values = threads.object.get("values") orelse return null;
+    if (values != .array or values.array.items.len == 0) return null;
+
+    const first_thread = values.array.items[0];
+    if (first_thread != .object) return null;
+    const stacktrace = first_thread.object.get("stacktrace") orelse return null;
+    if (stacktrace != .object) return null;
+    const frames = stacktrace.object.get("frames") orelse return null;
+    if (frames != .array or frames.array.items.len == 0) return null;
+
+    const first_frame = frames.array.items[0];
+    if (first_frame != .object) return null;
+    const in_app = first_frame.object.get("in_app") orelse return null;
+    return switch (in_app) {
+        .bool => |value| value,
+        else => null,
+    };
+}
+
 fn hasDebugMetaImages(event: *const Event) bool {
     const debug_meta = event.debug_meta orelse return false;
     if (debug_meta != .object) return false;
@@ -2732,6 +2845,7 @@ var before_send_saw_threads: bool = false;
 var before_send_saw_debug_meta_images: bool = false;
 var before_send_debug_meta_custom_preserved: bool = false;
 var before_send_first_frame_in_app: ?bool = null;
+var before_send_first_thread_frame_in_app: ?bool = null;
 var before_send_observed_server_name: ?[]const u8 = null;
 var before_send_observed_dist: ?[]const u8 = null;
 var before_send_observed_platform: ?[]const u8 = null;
@@ -2833,6 +2947,11 @@ fn inspectInAppBeforeSend(event: *Event) ?*Event {
             }
         }
     }
+    return event;
+}
+
+fn inspectThreadInAppBeforeSend(event: *Event) ?*Event {
+    before_send_first_thread_frame_in_app = firstThreadFrameInApp(event);
     return event;
 }
 
@@ -3348,6 +3467,49 @@ test "Client in_app_exclude marks matching exception frames as in_app=false" {
 
     try testing.expect(client.captureEventId(&event) != null);
     try testing.expectEqual(@as(?bool, false), before_send_first_frame_in_app);
+}
+
+test "Client in_app_include marks matching thread frames without mutating input event" {
+    before_send_first_thread_frame_in_app = null;
+
+    const include_patterns = [_][]const u8{"my.app"};
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .in_app_include = &include_patterns,
+        .before_send = inspectThreadInAppBeforeSend,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var frame_object = json.ObjectMap.init(testing.allocator);
+    try Client.putOwnedString(testing.allocator, &frame_object, "module", "my.app.worker");
+    try Client.putOwnedString(testing.allocator, &frame_object, "function", "run");
+
+    var frames_array = json.Array.init(testing.allocator);
+    try frames_array.append(.{ .object = frame_object });
+
+    var stacktrace_object = json.ObjectMap.init(testing.allocator);
+    try Client.putOwnedJsonEntry(testing.allocator, &stacktrace_object, "frames", .{ .array = frames_array });
+
+    var thread_object = json.ObjectMap.init(testing.allocator);
+    try Client.putOwnedJsonEntry(testing.allocator, &thread_object, "stacktrace", .{ .object = stacktrace_object });
+
+    var values_array = json.Array.init(testing.allocator);
+    try values_array.append(.{ .object = thread_object });
+
+    var threads_object = json.ObjectMap.init(testing.allocator);
+    defer {
+        var owned_threads: json.Value = .{ .object = threads_object };
+        scope_mod.deinitJsonValueDeep(testing.allocator, &owned_threads);
+    }
+    try Client.putOwnedJsonEntry(testing.allocator, &threads_object, "values", .{ .array = values_array });
+
+    var event = Event.initMessage("thread-stacktrace", .info);
+    event.threads = .{ .object = threads_object };
+
+    try testing.expect(client.captureEventId(&event) != null);
+    try testing.expectEqual(@as(?bool, true), before_send_first_thread_frame_in_app);
+    try testing.expectEqual(@as(?bool, null), firstThreadFrameInApp(&event));
 }
 
 test "Client attach_stacktrace adds synthetic thread stacktrace data" {
