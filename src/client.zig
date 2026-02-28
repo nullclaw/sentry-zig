@@ -3138,6 +3138,29 @@ fn firstThreadFrameInApp(event: *const Event) ?bool {
     };
 }
 
+fn secondThreadFrameInApp(event: *const Event) ?bool {
+    const threads = event.threads orelse return null;
+    if (threads != .object) return null;
+
+    const values = threads.object.get("values") orelse return null;
+    if (values != .array or values.array.items.len == 0) return null;
+
+    const first_thread = values.array.items[0];
+    if (first_thread != .object) return null;
+    const stacktrace = first_thread.object.get("stacktrace") orelse return null;
+    if (stacktrace != .object) return null;
+    const frames = stacktrace.object.get("frames") orelse return null;
+    if (frames != .array or frames.array.items.len < 2) return null;
+
+    const second_frame = frames.array.items[1];
+    if (second_frame != .object) return null;
+    const in_app = second_frame.object.get("in_app") orelse return null;
+    return switch (in_app) {
+        .bool => |value| value,
+        else => null,
+    };
+}
+
 fn firstEventStacktraceFrameInApp(event: *const Event) ?bool {
     const stacktrace = event.stacktrace orelse return null;
     if (stacktrace.frames.len == 0) return null;
@@ -3215,6 +3238,7 @@ var before_send_first_frame_in_app: ?bool = null;
 var before_send_first_thread_frame_in_app: ?bool = null;
 var before_send_first_event_stacktrace_frame_in_app: ?bool = null;
 var before_send_second_exception_frame_in_app: ?bool = null;
+var before_send_second_thread_frame_in_app: ?bool = null;
 var before_send_second_event_stacktrace_frame_in_app: ?bool = null;
 var expected_frame_package: ?[]const u8 = null;
 var before_send_exception_frame_package_matches_expected: bool = false;
@@ -3333,6 +3357,7 @@ fn inspectInAppBeforeSend(event: *Event) ?*Event {
 
 fn inspectThreadInAppBeforeSend(event: *Event) ?*Event {
     before_send_first_thread_frame_in_app = firstThreadFrameInApp(event);
+    before_send_second_thread_frame_in_app = secondThreadFrameInApp(event);
     before_send_thread_frame_package_matches_expected = false;
     if (expected_frame_package) |expected| {
         if (firstThreadFramePackage(event)) |package| {
@@ -4078,6 +4103,51 @@ test "Client in_app fallback marks thread frames as true when no frame is in_app
     try testing.expect(client.captureEventId(&event) != null);
     try testing.expectEqual(@as(?bool, true), before_send_first_thread_frame_in_app);
     try testing.expectEqual(@as(?bool, null), firstThreadFrameInApp(&event));
+}
+
+test "Client fallback ignores in_app=true on thread frame without function and still resolves other frames" {
+    before_send_second_thread_frame_in_app = null;
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .default_integrations = true,
+        .before_send = inspectThreadInAppBeforeSend,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var first_frame_object = json.ObjectMap.init(testing.allocator);
+    try Client.putOwnedJsonEntry(testing.allocator, &first_frame_object, "in_app", .{ .bool = true });
+
+    var second_frame_object = json.ObjectMap.init(testing.allocator);
+    try Client.putOwnedString(testing.allocator, &second_frame_object, "function", "vendor::lib::worker::run");
+
+    var frames_array = json.Array.init(testing.allocator);
+    try frames_array.append(.{ .object = first_frame_object });
+    try frames_array.append(.{ .object = second_frame_object });
+
+    var stacktrace_object = json.ObjectMap.init(testing.allocator);
+    try Client.putOwnedJsonEntry(testing.allocator, &stacktrace_object, "frames", .{ .array = frames_array });
+
+    var thread_object = json.ObjectMap.init(testing.allocator);
+    try Client.putOwnedJsonEntry(testing.allocator, &thread_object, "stacktrace", .{ .object = stacktrace_object });
+
+    var values_array = json.Array.init(testing.allocator);
+    try values_array.append(.{ .object = thread_object });
+
+    var threads_object = json.ObjectMap.init(testing.allocator);
+    defer {
+        var owned_threads: json.Value = .{ .object = threads_object };
+        scope_mod.deinitJsonValueDeep(testing.allocator, &owned_threads);
+    }
+    try Client.putOwnedJsonEntry(testing.allocator, &threads_object, "values", .{ .array = values_array });
+
+    var event = Event.initMessage("thread-stacktrace-no-func-in-app", .info);
+    event.threads = .{ .object = threads_object };
+
+    try testing.expect(client.captureEventId(&event) != null);
+    try testing.expectEqual(@as(?bool, true), before_send_second_thread_frame_in_app);
+    try testing.expectEqual(@as(?bool, null), secondThreadFrameInApp(&event));
 }
 
 test "Client in_app_include marks matching event stacktrace frames without mutating input event" {
