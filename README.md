@@ -737,6 +737,7 @@ Structured log records automatically include default `sentry.environment`,
 `sentry.release`, and `server.address` attributes when configured.
 When `server_name` is unset and `default_integrations = true`, the SDK attempts to use the local hostname.
 `in_app_include`/`in_app_exclude` are applied to exception and thread stack frames.
+When no frame is marked `in_app=true`, frames with missing `in_app` are treated as `true`.
 `attach_debug_images=true` injects default `debug_meta.images` metadata for events that do not already include debug image info.
 `accept_invalid_certs=true` is intended for local/dev environments and is not supported together with explicit proxy transport.
 

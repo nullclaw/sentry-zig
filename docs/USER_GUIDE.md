@@ -945,6 +945,8 @@ Set `default_integrations=false` to disable automatic `runtime`/`os` context enr
 Set `in_app_include` / `in_app_exclude` to classify exception and thread stack frames.
 Matching `in_app_include` patterns set `frame.in_app=true`, matching
 `in_app_exclude` patterns set `frame.in_app=false`.
+If no frame in a stacktrace is marked `in_app=true`, frames without explicit
+`in_app` are treated as `true`.
 For transaction envelopes, the SDK adds a dynamic trace header
 (`trace_id/public_key/sample_rate/sampled`).
 

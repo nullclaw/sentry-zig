@@ -1224,10 +1224,26 @@ pub const Client = struct {
                 const frames_copy = try allocator.alloc(Frame, stacktrace.frames.len);
                 @memcpy(frames_copy, stacktrace.frames);
 
+                var stacktrace_has_in_app = false;
                 for (frames_copy) |*frame| {
-                    if (frame.in_app == null) {
-                        if (inferInApp(frame.*, in_app_include, in_app_exclude)) |in_app| {
-                            frame.in_app = in_app;
+                    if (frame.in_app) |in_app| {
+                        if (in_app) stacktrace_has_in_app = true;
+                        continue;
+                    }
+
+                    if (inferInApp(frame.*, in_app_include, in_app_exclude)) |in_app| {
+                        frame.in_app = in_app;
+                        any_modified = true;
+                        if (in_app) stacktrace_has_in_app = true;
+                    }
+                }
+
+                // Rust SDK parity (`process-stacktrace`):
+                // if no frame is marked `in_app=true`, treat missing `in_app` as true.
+                if (!stacktrace_has_in_app) {
+                    for (frames_copy) |*frame| {
+                        if (frame.in_app == null) {
+                            frame.in_app = true;
                             any_modified = true;
                         }
                     }
@@ -1282,12 +1298,20 @@ pub const Client = struct {
             const frames_ptr = stacktrace_ptr.object.getPtr("frames") orelse continue;
             if (frames_ptr.* != .array) continue;
 
+            var stacktrace_has_in_app = false;
             for (frames_ptr.array.items) |*frame_value| {
                 if (frame_value.* != .object) continue;
 
                 const existing_in_app = frame_value.object.getPtr("in_app");
                 if (existing_in_app) |in_app_ptr| {
-                    if (in_app_ptr.* != .null) continue;
+                    switch (in_app_ptr.*) {
+                        .bool => |in_app| {
+                            if (in_app) stacktrace_has_in_app = true;
+                            continue;
+                        },
+                        .null => {},
+                        else => continue,
+                    }
                 }
 
                 if (inferInAppFromThreadFrame(&frame_value.object, in_app_include, in_app_exclude)) |in_app| {
@@ -1297,6 +1321,28 @@ pub const Client = struct {
                         try putOwnedJsonEntry(allocator, &frame_value.object, "in_app", .{ .bool = in_app });
                     }
                     any_modified = true;
+                    if (in_app) stacktrace_has_in_app = true;
+                }
+            }
+
+            if (!stacktrace_has_in_app) {
+                for (frames_ptr.array.items) |*frame_value| {
+                    if (frame_value.* != .object) continue;
+
+                    const existing_in_app = frame_value.object.getPtr("in_app");
+                    if (existing_in_app) |in_app_ptr| {
+                        switch (in_app_ptr.*) {
+                            .bool => continue,
+                            .null => {
+                                in_app_ptr.* = .{ .bool = true };
+                                any_modified = true;
+                            },
+                            else => continue,
+                        }
+                    } else {
+                        try putOwnedJsonEntry(allocator, &frame_value.object, "in_app", .{ .bool = true });
+                        any_modified = true;
+                    }
                 }
             }
         }
@@ -3505,6 +3551,77 @@ test "Client in_app_include marks matching thread frames without mutating input 
     try Client.putOwnedJsonEntry(testing.allocator, &threads_object, "values", .{ .array = values_array });
 
     var event = Event.initMessage("thread-stacktrace", .info);
+    event.threads = .{ .object = threads_object };
+
+    try testing.expect(client.captureEventId(&event) != null);
+    try testing.expectEqual(@as(?bool, true), before_send_first_thread_frame_in_app);
+    try testing.expectEqual(@as(?bool, null), firstThreadFrameInApp(&event));
+}
+
+test "Client in_app fallback marks exception frames as true when no frame is in_app" {
+    before_send_first_frame_in_app = null;
+
+    const include_patterns = [_][]const u8{"my.app"};
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .in_app_include = &include_patterns,
+        .before_send = inspectInAppBeforeSend,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    const frames = [_]Frame{.{
+        .module = "vendor.lib.payment",
+        .function = "execute",
+    }};
+    const values = [_]ExceptionValue{.{
+        .type = "VendorError",
+        .value = "timeout",
+        .stacktrace = Stacktrace{ .frames = &frames },
+    }};
+    var event = Event.initException(&values);
+
+    try testing.expect(client.captureEventId(&event) != null);
+    try testing.expectEqual(@as(?bool, true), before_send_first_frame_in_app);
+    try testing.expectEqual(@as(?bool, null), frames[0].in_app);
+}
+
+test "Client in_app fallback marks thread frames as true when no frame is in_app" {
+    before_send_first_thread_frame_in_app = null;
+
+    const include_patterns = [_][]const u8{"my.app"};
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .in_app_include = &include_patterns,
+        .before_send = inspectThreadInAppBeforeSend,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var frame_object = json.ObjectMap.init(testing.allocator);
+    try Client.putOwnedString(testing.allocator, &frame_object, "module", "vendor.lib.worker");
+    try Client.putOwnedString(testing.allocator, &frame_object, "function", "run");
+
+    var frames_array = json.Array.init(testing.allocator);
+    try frames_array.append(.{ .object = frame_object });
+
+    var stacktrace_object = json.ObjectMap.init(testing.allocator);
+    try Client.putOwnedJsonEntry(testing.allocator, &stacktrace_object, "frames", .{ .array = frames_array });
+
+    var thread_object = json.ObjectMap.init(testing.allocator);
+    try Client.putOwnedJsonEntry(testing.allocator, &thread_object, "stacktrace", .{ .object = stacktrace_object });
+
+    var values_array = json.Array.init(testing.allocator);
+    try values_array.append(.{ .object = thread_object });
+
+    var threads_object = json.ObjectMap.init(testing.allocator);
+    defer {
+        var owned_threads: json.Value = .{ .object = threads_object };
+        scope_mod.deinitJsonValueDeep(testing.allocator, &owned_threads);
+    }
+    try Client.putOwnedJsonEntry(testing.allocator, &threads_object, "values", .{ .array = values_array });
+
+    var event = Event.initMessage("thread-fallback", .info);
     event.threads = .{ .object = threads_object };
 
     try testing.expect(client.captureEventId(&event) != null);
