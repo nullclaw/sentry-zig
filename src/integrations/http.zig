@@ -129,7 +129,7 @@ pub const RequestContext = struct {
             if (extracted.sentry_trace_header) |header| {
                 merged_options.sentry_trace_header = header;
             } else if (extracted.traceparent_header) |traceparent| {
-                if (sentryTraceFromTraceParent(traceparent, &sentry_trace_from_traceparent)) |converted| {
+                if (propagation.sentryTraceFromTraceParent(traceparent, &sentry_trace_from_traceparent)) |converted| {
                     merged_options.sentry_trace_header = converted;
                 }
             }
@@ -490,18 +490,6 @@ pub fn extractIncomingPropagationHeaders(headers: []const PropagationHeader) Inc
     return propagation.parsePropagationHeaders(headers);
 }
 
-fn sentryTraceFromTraceParent(traceparent: []const u8, output: *[51]u8) ?[]const u8 {
-    const parsed = propagation.parseTraceParent(traceparent) orelse return null;
-    const sampled: u8 = if (parsed.sampled == true) '1' else '0';
-
-    @memcpy(output[0..32], parsed.trace_id[0..]);
-    output[32] = '-';
-    @memcpy(output[33..49], parsed.parent_span_id[0..]);
-    output[49] = '-';
-    output[50] = sampled;
-    return output[0..];
-}
-
 fn breadcrumbLevelFromStatus(status_code: ?u16) Level {
     const code = status_code orelse return .info;
     if (code >= 500) return .err;
@@ -622,6 +610,25 @@ fn assertOutgoingTypedHandler(comptime HandlerType: type, comptime ContextType: 
     assertErrorUnionU16Return(return_type, api_name);
 }
 
+fn executeIncomingHandler(
+    request_context: *RequestContext,
+    handler: IncomingHandlerFn,
+    handler_ctx: ?*anyopaque,
+    run_options: IncomingRunOptions,
+) anyerror!u16 {
+    const status_code = handler(request_context, handler_ctx) catch |err| {
+        if (run_options.capture_errors) {
+            _ = request_context.fail(err, run_options.error_status_code);
+        } else {
+            request_context.finish(run_options.error_status_code);
+        }
+        return err;
+    };
+
+    request_context.finish(status_code);
+    return status_code;
+}
+
 /// Run an incoming HTTP handler inside `RequestContext` lifecycle.
 ///
 /// The handler returns response status code. On success the transaction is
@@ -637,18 +644,7 @@ pub fn runIncomingRequest(
 ) anyerror!u16 {
     var request_context = try RequestContext.begin(allocator, client, request_options);
     defer request_context.deinit();
-
-    const status_code = handler(&request_context, handler_ctx) catch |err| {
-        if (run_options.capture_errors) {
-            _ = request_context.fail(err, run_options.error_status_code);
-        } else {
-            request_context.finish(run_options.error_status_code);
-        }
-        return err;
-    };
-
-    request_context.finish(status_code);
-    return status_code;
+    return executeIncomingHandler(&request_context, handler, handler_ctx, run_options);
 }
 
 /// Typed variant of `runIncomingRequest`.
@@ -699,18 +695,7 @@ pub fn runIncomingRequestFromHeaders(
 ) anyerror!u16 {
     var request_context = try RequestContext.beginFromHeaders(allocator, client, request_options, headers);
     defer request_context.deinit();
-
-    const status_code = handler(&request_context, handler_ctx) catch |err| {
-        if (run_options.capture_errors) {
-            _ = request_context.fail(err, run_options.error_status_code);
-        } else {
-            request_context.finish(run_options.error_status_code);
-        }
-        return err;
-    };
-
-    request_context.finish(status_code);
-    return status_code;
+    return executeIncomingHandler(&request_context, handler, handler_ctx, run_options);
 }
 
 /// Typed variant of `runIncomingRequestFromHeaders`.
@@ -754,6 +739,25 @@ pub const OutgoingRunOptions = struct {
     capture_errors: bool = true,
 };
 
+fn executeOutgoingHandler(
+    request_context: *OutgoingRequestContext,
+    handler: OutgoingHandlerFn,
+    handler_ctx: ?*anyopaque,
+    run_options: OutgoingRunOptions,
+) anyerror!u16 {
+    const status_code = handler(request_context, handler_ctx) catch |err| {
+        if (run_options.capture_errors) {
+            _ = request_context.fail(err, run_options.error_status_code);
+        } else {
+            request_context.finish(run_options.error_status_code);
+        }
+        return err;
+    };
+
+    request_context.finish(status_code);
+    return status_code;
+}
+
 /// Run an outgoing HTTP operation inside `OutgoingRequestContext` lifecycle.
 ///
 /// The handler returns upstream status code. On success the child span is
@@ -767,18 +771,7 @@ pub fn runOutgoingRequest(
 ) anyerror!u16 {
     var request_context = try OutgoingRequestContext.begin(request_options);
     defer request_context.deinit();
-
-    const status_code = handler(&request_context, handler_ctx) catch |err| {
-        if (run_options.capture_errors) {
-            _ = request_context.fail(err, run_options.error_status_code);
-        } else {
-            request_context.finish(run_options.error_status_code);
-        }
-        return err;
-    };
-
-    request_context.finish(status_code);
-    return status_code;
+    return executeOutgoingHandler(&request_context, handler, handler_ctx, run_options);
 }
 
 /// Typed variant of `runOutgoingRequest`.

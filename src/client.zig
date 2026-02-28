@@ -921,22 +921,18 @@ pub const Client = struct {
         }
 
         if (traceparent_header) |traceparent| {
-            if (propagation.parseTraceParent(traceparent)) |parsed| {
-                var converted_sentry_trace: [51]u8 = undefined;
-                @memcpy(converted_sentry_trace[0..32], parsed.trace_id[0..]);
-                converted_sentry_trace[32] = '-';
-                @memcpy(converted_sentry_trace[33..49], parsed.parent_span_id[0..]);
-                converted_sentry_trace[49] = '-';
-                converted_sentry_trace[50] = if (parsed.sampled == true) '1' else '0';
-
+            var converted_sentry_trace: [51]u8 = undefined;
+            if (propagation.sentryTraceFromTraceParent(traceparent, &converted_sentry_trace)) |converted| {
                 if (self.startTransactionFromPropagationHeaders(
                     opts,
-                    converted_sentry_trace[0..],
+                    converted,
                     baggage_header,
                 ) catch null) |continued| {
                     return continued;
                 }
+            }
 
+            if (propagation.parseTraceParent(traceparent)) |parsed| {
                 var real_opts = opts;
                 real_opts.parent_trace_id = parsed.trace_id;
                 real_opts.parent_span_id = parsed.parent_span_id;

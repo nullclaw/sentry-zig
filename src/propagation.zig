@@ -164,6 +164,22 @@ pub fn parseTraceParentFromHeaders(headers: []const PropagationHeader) ?TracePar
     return parseTraceParent(traceparent);
 }
 
+/// Convert W3C `traceparent` to Sentry `sentry-trace` textual form.
+///
+/// The output buffer must be exactly 51 bytes:
+/// `<32 trace id>-<16 parent span id>-<1 sampled flag>`.
+pub fn sentryTraceFromTraceParent(traceparent: []const u8, output: *[51]u8) ?[]const u8 {
+    const parsed = parseTraceParent(traceparent) orelse return null;
+    const sampled: u8 = if (parsed.sampled == true) '1' else '0';
+
+    @memcpy(output[0..32], parsed.trace_id[0..]);
+    output[32] = '-';
+    @memcpy(output[33..49], parsed.parent_span_id[0..]);
+    output[49] = '-';
+    output[50] = sampled;
+    return output[0..];
+}
+
 pub fn formatSentryTraceAlloc(allocator: Allocator, trace: SentryTrace) ![]u8 {
     if (trace.sampled) |sampled| {
         return std.fmt.allocPrint(
@@ -516,6 +532,20 @@ test "parseTraceParentFromHeaders is case-insensitive" {
     };
     const parsed = parseTraceParentFromHeaders(&headers).?;
     try testing.expectEqualStrings("0123456789abcdef0123456789abcdef", parsed.trace_id[0..]);
+}
+
+test "sentryTraceFromTraceParent converts to sentry-trace representation" {
+    var output: [51]u8 = undefined;
+    const converted = sentryTraceFromTraceParent(
+        "00-0123456789abcdef0123456789abcdef-89abcdef01234567-01",
+        &output,
+    ).?;
+    try testing.expectEqualStrings("0123456789abcdef0123456789abcdef-89abcdef01234567-1", converted);
+}
+
+test "sentryTraceFromTraceParent returns null for invalid traceparent" {
+    var output: [51]u8 = undefined;
+    try testing.expect(sentryTraceFromTraceParent("invalid", &output) == null);
 }
 
 test "formatSentryTraceAlloc emits expected format" {
