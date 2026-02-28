@@ -945,6 +945,8 @@ Set `default_integrations=false` to disable automatic `runtime`/`os` context enr
 Set `in_app_include` / `in_app_exclude` to classify event, exception, and thread stack frames.
 Matching `in_app_include` patterns set `frame.in_app=true`, matching
 `in_app_exclude` patterns set `frame.in_app=false`.
+Include/exclude patterns are matched against Rust-style `frame.function`
+prefixes.
 With `default_integrations=true`, stacktrace frames are also classified even
 without explicit include/exclude patterns.
 Well-known runtime/library function prefixes (for example `std::`, `core::`,

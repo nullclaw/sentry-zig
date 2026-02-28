@@ -738,6 +738,7 @@ Structured log records automatically include default `sentry.environment`,
 When `server_name` is unset and `default_integrations = true`, the SDK attempts to use the local hostname.
 `in_app_include`/`in_app_exclude` are applied to event, exception, and thread stack frames.
 With `default_integrations=true`, stacktrace frames are also classified even without explicit in-app patterns.
+Include/exclude patterns are matched against Rust-style `frame.function` prefixes.
 Well-known runtime/library function prefixes (for example `std::`, `core::`, `tokio::`) are classified as `in_app=false`.
 When a frame has `function` but no `package`, package is derived from Rust-style symbol prefixes (`crate::`, `crate..`, `crate[hash]::`, impl-style symbols).
 When no frame is marked `in_app=true`, frames with missing `in_app` are treated as `true`.

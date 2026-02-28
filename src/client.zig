@@ -1599,11 +1599,12 @@ pub const Client = struct {
         in_app_include: ?[]const []const u8,
         in_app_exclude: ?[]const []const u8,
     ) ?bool {
+        if (frame.function == null) return null;
         if (in_app_include) |include_patterns| {
-            if (matchFramePatterns(frame, include_patterns)) return true;
+            if (matchFunctionPatterns(frame, include_patterns)) return true;
         }
         if (in_app_exclude) |exclude_patterns| {
-            if (matchFramePatterns(frame, exclude_patterns)) return false;
+            if (matchFunctionPatterns(frame, exclude_patterns)) return false;
         }
         if (isWellKnownNotInApp(frame)) return false;
         return null;
@@ -1639,20 +1640,11 @@ pub const Client = struct {
         return false;
     }
 
-    fn matchFramePatterns(frame: Frame, patterns: []const []const u8) bool {
+    fn matchFunctionPatterns(frame: Frame, patterns: []const []const u8) bool {
+        const function = frame.function orelse return false;
         for (patterns) |pattern| {
             if (pattern.len == 0) continue;
-            if (frameFieldMatches(frame.filename, pattern)) return true;
-            if (frameFieldMatches(frame.function, pattern)) return true;
-            if (frameFieldMatches(frame.module, pattern)) return true;
-            if (frameFieldMatches(frame.abs_path, pattern)) return true;
-        }
-        return false;
-    }
-
-    fn frameFieldMatches(field: ?[]const u8, pattern: []const u8) bool {
-        if (field) |value| {
-            return std.mem.indexOf(u8, value, pattern) != null;
+            if (functionStartsWithRustPattern(function, pattern)) return true;
         }
         return false;
     }
@@ -3801,7 +3793,7 @@ test "Client explicit event dist takes precedence over option dist" {
 test "Client in_app_include marks matching exception frames as in_app=true" {
     before_send_first_frame_in_app = null;
 
-    const include_patterns = [_][]const u8{"my.app"};
+    const include_patterns = [_][]const u8{"my_app::"};
     const client = try Client.init(testing.allocator, .{
         .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
         .in_app_include = &include_patterns,
@@ -3812,7 +3804,7 @@ test "Client in_app_include marks matching exception frames as in_app=true" {
 
     const frames = [_]Frame{.{
         .module = "my.app.checkout",
-        .function = "process_order",
+        .function = "my_app::checkout::process_order",
     }};
     const values = [_]ExceptionValue{.{
         .type = "CheckoutError",
@@ -3828,7 +3820,7 @@ test "Client in_app_include marks matching exception frames as in_app=true" {
 test "Client in_app_exclude marks matching exception frames as in_app=false" {
     before_send_first_frame_in_app = null;
 
-    const exclude_patterns = [_][]const u8{"vendor.lib"};
+    const exclude_patterns = [_][]const u8{"vendor::lib::"};
     const client = try Client.init(testing.allocator, .{
         .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
         .in_app_exclude = &exclude_patterns,
@@ -3839,7 +3831,7 @@ test "Client in_app_exclude marks matching exception frames as in_app=false" {
 
     const frames = [_]Frame{.{
         .module = "vendor.lib.payment",
-        .function = "execute",
+        .function = "vendor::lib::payment::execute",
     }};
     const values = [_]ExceptionValue{.{
         .type = "VendorError",
@@ -3883,7 +3875,7 @@ test "Client default integrations derive exception frame package from function" 
 test "Client in_app_include marks matching thread frames without mutating input event" {
     before_send_first_thread_frame_in_app = null;
 
-    const include_patterns = [_][]const u8{"my.app"};
+    const include_patterns = [_][]const u8{"my_app::"};
     const client = try Client.init(testing.allocator, .{
         .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
         .in_app_include = &include_patterns,
@@ -3894,7 +3886,7 @@ test "Client in_app_include marks matching thread frames without mutating input 
 
     var frame_object = json.ObjectMap.init(testing.allocator);
     try Client.putOwnedString(testing.allocator, &frame_object, "module", "my.app.worker");
-    try Client.putOwnedString(testing.allocator, &frame_object, "function", "run");
+    try Client.putOwnedString(testing.allocator, &frame_object, "function", "my_app::worker::run");
 
     var frames_array = json.Array.init(testing.allocator);
     try frames_array.append(.{ .object = frame_object });
@@ -3969,7 +3961,7 @@ test "Client default integrations derive thread frame package from function with
 test "Client in_app fallback marks exception frames as true when no frame is in_app" {
     before_send_first_frame_in_app = null;
 
-    const include_patterns = [_][]const u8{"my.app"};
+    const include_patterns = [_][]const u8{"my_app::"};
     const client = try Client.init(testing.allocator, .{
         .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
         .in_app_include = &include_patterns,
@@ -3980,7 +3972,7 @@ test "Client in_app fallback marks exception frames as true when no frame is in_
 
     const frames = [_]Frame{.{
         .module = "vendor.lib.payment",
-        .function = "execute",
+        .function = "vendor::lib::payment::execute",
     }};
     const values = [_]ExceptionValue{.{
         .type = "VendorError",
@@ -3997,7 +3989,7 @@ test "Client in_app fallback marks exception frames as true when no frame is in_
 test "Client in_app fallback marks thread frames as true when no frame is in_app" {
     before_send_first_thread_frame_in_app = null;
 
-    const include_patterns = [_][]const u8{"my.app"};
+    const include_patterns = [_][]const u8{"my_app::"};
     const client = try Client.init(testing.allocator, .{
         .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
         .in_app_include = &include_patterns,
@@ -4008,7 +4000,7 @@ test "Client in_app fallback marks thread frames as true when no frame is in_app
 
     var frame_object = json.ObjectMap.init(testing.allocator);
     try Client.putOwnedString(testing.allocator, &frame_object, "module", "vendor.lib.worker");
-    try Client.putOwnedString(testing.allocator, &frame_object, "function", "run");
+    try Client.putOwnedString(testing.allocator, &frame_object, "function", "vendor::lib::worker::run");
 
     var frames_array = json.Array.init(testing.allocator);
     try frames_array.append(.{ .object = frame_object });
@@ -4040,7 +4032,7 @@ test "Client in_app fallback marks thread frames as true when no frame is in_app
 test "Client in_app_include marks matching event stacktrace frames without mutating input event" {
     before_send_first_event_stacktrace_frame_in_app = null;
 
-    const include_patterns = [_][]const u8{"my.app"};
+    const include_patterns = [_][]const u8{"my_app::"};
     const client = try Client.init(testing.allocator, .{
         .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
         .in_app_include = &include_patterns,
@@ -4051,7 +4043,7 @@ test "Client in_app_include marks matching event stacktrace frames without mutat
 
     const frames = [_]Frame{.{
         .module = "my.app.entry",
-        .function = "execute",
+        .function = "my_app::entry::execute",
     }};
     var event = Event.initMessage("event-stacktrace-include", .info);
     event.stacktrace = .{ .frames = &frames };
@@ -4132,7 +4124,7 @@ test "functionStartsWithRustPattern handles impl-style symbol prefixes" {
 test "Client in_app fallback marks event stacktrace frames as true when unresolved" {
     before_send_first_event_stacktrace_frame_in_app = null;
 
-    const include_patterns = [_][]const u8{"my.app"};
+    const include_patterns = [_][]const u8{"my_app::"};
     const client = try Client.init(testing.allocator, .{
         .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
         .in_app_include = &include_patterns,
@@ -4143,7 +4135,7 @@ test "Client in_app fallback marks event stacktrace frames as true when unresolv
 
     const frames = [_]Frame{.{
         .module = "vendor.lib.runtime",
-        .function = "dispatch",
+        .function = "vendor::lib::runtime::dispatch",
     }};
     var event = Event.initMessage("event-stacktrace-fallback", .info);
     event.stacktrace = .{ .frames = &frames };
