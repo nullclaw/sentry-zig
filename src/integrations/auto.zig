@@ -66,6 +66,21 @@ pub fn initWithDefaults(allocator: std.mem.Allocator, options: Options) !*Client
     return Client.init(allocator, effective_options);
 }
 
+/// Same as `initWithDefaults`, but fills missing options from environment variables.
+pub fn initWithDefaultsFromEnv(allocator: std.mem.Allocator, options: Options) !*Client {
+    var merged: std.ArrayListUnmanaged(Integration) = .{};
+    defer merged.deinit(allocator);
+
+    try merged.appendSlice(allocator, defaults());
+    if (options.integrations) |user_integrations| {
+        try merged.appendSlice(allocator, user_integrations);
+    }
+
+    var effective_options = options;
+    effective_options.integrations = merged.items;
+    return Client.initWithEnvDefaults(allocator, effective_options);
+}
+
 /// Guard returned by `initGlobalWithDefaults`.
 ///
 /// It owns the created client and detached hub and restores previous TLS hub
@@ -125,6 +140,26 @@ pub fn initGlobalWithDefaults(allocator: std.mem.Allocator, options: Options) !I
     };
 }
 
+/// Same as `initGlobalWithDefaults`, but fills missing options from environment variables.
+pub fn initGlobalWithDefaultsFromEnv(allocator: std.mem.Allocator, options: Options) !InitGuard {
+    const client = try initWithDefaultsFromEnv(allocator, options);
+    errdefer client.deinit();
+
+    const hub = try allocator.create(Hub);
+    errdefer allocator.destroy(hub);
+
+    hub.* = try Hub.init(allocator, client);
+    errdefer hub.deinit();
+
+    const previous_hub = Hub.setCurrent(hub);
+    return .{
+        .allocator = allocator,
+        .client = client,
+        .hub = hub,
+        .previous_hub = previous_hub,
+    };
+}
+
 /// Install runtime config and initialize client with default integrations.
 pub fn initWithDefaultsAndRuntime(
     allocator: std.mem.Allocator,
@@ -135,6 +170,16 @@ pub fn initWithDefaultsAndRuntime(
     return initWithDefaults(allocator, options);
 }
 
+/// Install runtime config and initialize client with default integrations and env defaults.
+pub fn initWithDefaultsAndRuntimeFromEnv(
+    allocator: std.mem.Allocator,
+    options: Options,
+    runtime_options: RuntimeInstallOptions,
+) !*Client {
+    installRuntime(runtime_options);
+    return initWithDefaultsFromEnv(allocator, options);
+}
+
 /// Install runtime config and initialize global hub with default integrations.
 pub fn initGlobalWithDefaultsAndRuntime(
     allocator: std.mem.Allocator,
@@ -143,6 +188,16 @@ pub fn initGlobalWithDefaultsAndRuntime(
 ) !InitGuard {
     installRuntime(runtime_options);
     return initGlobalWithDefaults(allocator, options);
+}
+
+/// Install runtime config and initialize global hub with default integrations and env defaults.
+pub fn initGlobalWithDefaultsAndRuntimeFromEnv(
+    allocator: std.mem.Allocator,
+    options: Options,
+    runtime_options: RuntimeInstallOptions,
+) !InitGuard {
+    installRuntime(runtime_options);
+    return initGlobalWithDefaultsFromEnv(allocator, options);
 }
 
 /// Run incoming HTTP handler using client from current hub.

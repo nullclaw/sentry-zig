@@ -126,11 +126,36 @@ pub fn init(allocator: std.mem.Allocator, options: Options) !*Client {
     return Client.init(allocator, options);
 }
 
+/// Initialize a new Sentry client and fill missing options from environment variables.
+pub fn initWithEnvDefaults(allocator: std.mem.Allocator, options: Options) !*Client {
+    return Client.initWithEnvDefaults(allocator, options);
+}
+
 /// Initialize a new client, create a Hub, and bind it as the current thread-local Hub.
 ///
 /// Deinitialize the returned guard to restore the previous Hub and release resources.
 pub fn initGlobal(allocator: std.mem.Allocator, options: Options) !InitGuard {
     const client = try init(allocator, options);
+    errdefer client.deinit();
+
+    const hub = try allocator.create(Hub);
+    errdefer allocator.destroy(hub);
+
+    hub.* = try Hub.init(allocator, client);
+    errdefer hub.deinit();
+
+    const previous_hub = Hub.setCurrent(hub);
+    return .{
+        .allocator = allocator,
+        .client = client,
+        .hub = hub,
+        .previous_hub = previous_hub,
+    };
+}
+
+/// Same as `initGlobal`, but fills missing options from environment variables first.
+pub fn initGlobalWithEnvDefaults(allocator: std.mem.Allocator, options: Options) !InitGuard {
+    const client = try initWithEnvDefaults(allocator, options);
     errdefer client.deinit();
 
     const hub = try allocator.create(Hub);

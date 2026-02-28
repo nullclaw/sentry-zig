@@ -305,6 +305,16 @@ sentry.integrations.log.install(.{
 ```
 
 ```zig
+// Env-default bootstrap: populate missing fields from SENTRY_* and proxy env vars.
+// Use .dsn = "" to allow SENTRY_DSN to provide DSN.
+const client = try sentry.initWithEnvDefaults(allocator, .{
+    .dsn = "",
+    .install_signal_handlers = false,
+});
+defer client.deinit();
+```
+
+```zig
 // One-line built-in setup preset for Options.integrations
 const client = try sentry.init(allocator, .{
     .dsn = "https://PUBLIC_KEY@o0.ingest.sentry.io/PROJECT_ID",
@@ -708,6 +718,19 @@ When `server_name` is unset and `default_integrations = true`, the SDK attempts 
 `in_app_include`/`in_app_exclude` are applied to exception stack frames.
 `attach_debug_images=true` injects default `debug_meta.images` metadata for events that do not already include debug image info.
 `accept_invalid_certs=true` is intended for local/dev environments and is not supported together with explicit proxy transport.
+
+`initWithEnvDefaults` / `initGlobalWithEnvDefaults` resolve missing values from environment:
+- `SENTRY_DSN` (used only when `options.dsn` is blank)
+- `SENTRY_RELEASE`
+- `SENTRY_DIST`
+- `SENTRY_ENVIRONMENT`
+- `SENTRY_NAME`
+- `SENTRY_DEBUG`
+- `SENTRY_SAMPLE_RATE`
+- `SENTRY_TRACES_SAMPLE_RATE`
+- `HTTP_PROXY` / `http_proxy`
+- `HTTPS_PROXY` / `https_proxy`
+- `SSL_VERIFY` (`false` enables `accept_invalid_certs`)
 
 Example integration setup callback:
 

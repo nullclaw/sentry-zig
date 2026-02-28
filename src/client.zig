@@ -141,6 +141,27 @@ pub const Options = struct {
     shutdown_timeout_ms: u64 = 2000,
 };
 
+const OwnedOptionStrings = struct {
+    dsn: ?[]u8 = null,
+    release: ?[]u8 = null,
+    dist: ?[]u8 = null,
+    environment: ?[]u8 = null,
+    server_name: ?[]u8 = null,
+    http_proxy: ?[]u8 = null,
+    https_proxy: ?[]u8 = null,
+
+    fn deinit(self: *OwnedOptionStrings, allocator: Allocator) void {
+        if (self.dsn) |value| allocator.free(value);
+        if (self.release) |value| allocator.free(value);
+        if (self.dist) |value| allocator.free(value);
+        if (self.environment) |value| allocator.free(value);
+        if (self.server_name) |value| allocator.free(value);
+        if (self.http_proxy) |value| allocator.free(value);
+        if (self.https_proxy) |value| allocator.free(value);
+        self.* = .{};
+    }
+};
+
 /// The Sentry client, tying together DSN, Scope, Transport, Worker, and Session.
 /// Heap-allocated via `init` to avoid self-referential pointer issues.
 pub const Client = struct {
@@ -167,28 +188,73 @@ pub const Client = struct {
     log_batch_shutdown: bool = false,
     log_batch_thread: ?std.Thread = null,
     owned_integrations: ?[]Integration = null,
+    owned_option_strings: OwnedOptionStrings = .{},
     debug_image_code_file: ?[]u8 = null,
     debug_image_code_file_cached: bool = false,
 
     /// Initialize a new Client. Heap-allocates the Client struct so that
     /// internal pointers (e.g., the Worker's send_ctx) remain stable.
     pub fn init(allocator: Allocator, options: Options) !*Client {
-        if (!isValidSampleRate(options.sample_rate)) return error.InvalidSampleRate;
-        if (!isValidSampleRate(options.traces_sample_rate)) return error.InvalidTracesSampleRate;
+        return initInternal(allocator, options, null);
+    }
+
+    /// Initialize a new Client and fill missing options from environment variables.
+    ///
+    /// Supported keys:
+    /// - `SENTRY_DSN` (used only when `options.dsn` is blank)
+    /// - `SENTRY_RELEASE`
+    /// - `SENTRY_DIST`
+    /// - `SENTRY_ENVIRONMENT`
+    /// - `SENTRY_NAME`
+    /// - `SENTRY_DEBUG`
+    /// - `SENTRY_SAMPLE_RATE`
+    /// - `SENTRY_TRACES_SAMPLE_RATE`
+    /// - `HTTP_PROXY`/`http_proxy`
+    /// - `HTTPS_PROXY`/`https_proxy`
+    /// - `SSL_VERIFY` (false -> `accept_invalid_certs=true`)
+    pub fn initWithEnvDefaults(allocator: Allocator, options: Options) !*Client {
+        var env_map = std.process.getEnvMap(allocator) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return initInternal(allocator, options, null),
+        };
+        defer env_map.deinit();
+        return initInternal(allocator, options, &env_map);
+    }
+
+    fn initInternal(
+        allocator: Allocator,
+        options: Options,
+        env_map: ?*const std.process.EnvMap,
+    ) !*Client {
+        var effective_options = options;
+        var owned_option_strings: OwnedOptionStrings = .{};
+        errdefer owned_option_strings.deinit(allocator);
+
+        if (env_map) |value| {
+            try applyEnvDefaultsFromMap(
+                allocator,
+                &effective_options,
+                &owned_option_strings,
+                value,
+            );
+        }
+
+        if (!isValidSampleRate(effective_options.sample_rate)) return error.InvalidSampleRate;
+        if (!isValidSampleRate(effective_options.traces_sample_rate)) return error.InvalidTracesSampleRate;
 
         const self = try allocator.create(Client);
         errdefer allocator.destroy(self);
 
-        const dsn = Dsn.parse(options.dsn) catch return error.InvalidDsn;
+        const dsn = Dsn.parse(effective_options.dsn) catch return error.InvalidDsn;
 
-        var transport = try Transport.init(allocator, dsn, options.user_agent, TransportOptions{
-            .http_proxy = options.http_proxy,
-            .https_proxy = options.https_proxy,
-            .accept_invalid_certs = options.accept_invalid_certs,
+        var transport = try Transport.init(allocator, dsn, effective_options.user_agent, TransportOptions{
+            .http_proxy = effective_options.http_proxy,
+            .https_proxy = effective_options.https_proxy,
+            .accept_invalid_certs = effective_options.accept_invalid_certs,
         });
         errdefer transport.deinit();
 
-        var scope = try Scope.init(allocator, options.max_breadcrumbs);
+        var scope = try Scope.init(allocator, effective_options.max_breadcrumbs);
         errdefer scope.deinit();
 
         var worker = try Worker.init(allocator, transportSendCallback, @ptrCast(self));
@@ -196,19 +262,18 @@ pub const Client = struct {
 
         var default_server_name: ?[]u8 = null;
         errdefer if (default_server_name) |name| allocator.free(name);
-        if (options.default_integrations and options.server_name == null) {
+        if (effective_options.default_integrations and effective_options.server_name == null) {
             default_server_name = detectServerNameAlloc(allocator);
         }
 
         var owned_integrations: ?[]Integration = null;
         errdefer if (owned_integrations) |values| allocator.free(values);
-        if (options.integrations) |integrations| {
+        if (effective_options.integrations) |integrations| {
             const copied = try allocator.alloc(Integration, integrations.len);
             @memcpy(copied, integrations);
             owned_integrations = copied;
         }
 
-        var effective_options = options;
         effective_options.integrations = if (owned_integrations) |values| values else null;
 
         self.* = Client{
@@ -223,6 +288,7 @@ pub const Client = struct {
             .session = null,
             .last_event_id = null,
             .owned_integrations = owned_integrations,
+            .owned_option_strings = owned_option_strings,
             .debug_image_code_file = null,
             .debug_image_code_file_cached = false,
         };
@@ -241,19 +307,19 @@ pub const Client = struct {
         self.startLogBatcher();
         self.startSessionAggregateFlusher();
 
-        std.fs.cwd().makePath(options.cache_dir) catch {};
+        std.fs.cwd().makePath(self.options.cache_dir) catch {};
 
         // Install signal handlers if requested
-        if (options.install_signal_handlers) {
-            signal_handler.install(options.cache_dir);
+        if (self.options.install_signal_handlers) {
+            signal_handler.install(self.options.cache_dir);
         }
 
         // Check for pending crash from previous run
-        if (signal_handler.checkPendingCrash(allocator, options.cache_dir)) |signal_num| {
+        if (signal_handler.checkPendingCrash(allocator, self.options.cache_dir)) |signal_num| {
             self.captureCrashEvent(signal_num);
         }
 
-        if (options.auto_session_tracking) {
+        if (self.options.auto_session_tracking) {
             self.startSession();
         }
 
@@ -276,6 +342,7 @@ pub const Client = struct {
         if (self.default_server_name) |name| self.allocator.free(name);
         if (self.session_did) |did| self.allocator.free(did);
         if (self.owned_integrations) |values| self.allocator.free(values);
+        self.owned_option_strings.deinit(self.allocator);
         if (self.debug_image_code_file) |code_file| self.allocator.free(code_file);
         self.deinitSessionAggregates();
 
@@ -1824,6 +1891,143 @@ pub const Client = struct {
         return rate >= 0.0 and rate <= 1.0;
     }
 
+    fn applyEnvDefaultsFromMap(
+        allocator: Allocator,
+        options: *Options,
+        owned: *OwnedOptionStrings,
+        env_map: *const std.process.EnvMap,
+    ) !void {
+        try setOptionStringFromEnvIfMissing(allocator, &options.dsn, &owned.dsn, env_map, "SENTRY_DSN", true);
+        try setOptionStringFromEnvIfMissing(allocator, &options.release, &owned.release, env_map, "SENTRY_RELEASE", false);
+        try setOptionStringFromEnvIfMissing(allocator, &options.dist, &owned.dist, env_map, "SENTRY_DIST", false);
+        try setOptionStringFromEnvIfMissing(
+            allocator,
+            &options.environment,
+            &owned.environment,
+            env_map,
+            "SENTRY_ENVIRONMENT",
+            false,
+        );
+        try setOptionStringFromEnvIfMissing(allocator, &options.server_name, &owned.server_name, env_map, "SENTRY_NAME", false);
+
+        try setOptionStringFromEnvAliasesIfMissing(
+            allocator,
+            &options.http_proxy,
+            &owned.http_proxy,
+            env_map,
+            &.{ "HTTP_PROXY", "http_proxy" },
+        );
+        try setOptionStringFromEnvAliasesIfMissing(
+            allocator,
+            &options.https_proxy,
+            &owned.https_proxy,
+            env_map,
+            &.{ "HTTPS_PROXY", "https_proxy" },
+        );
+
+        if (!options.debug) {
+            if (env_map.get("SENTRY_DEBUG")) |value| {
+                if (parseEnvBool(value)) |parsed| {
+                    options.debug = parsed;
+                }
+            }
+        }
+
+        if (options.sample_rate == 1.0) {
+            if (env_map.get("SENTRY_SAMPLE_RATE")) |value| {
+                if (parseEnvSampleRate(value)) |parsed| {
+                    options.sample_rate = parsed;
+                }
+            }
+        }
+
+        if (options.traces_sampler == null and options.traces_sample_rate == 0.0) {
+            if (env_map.get("SENTRY_TRACES_SAMPLE_RATE")) |value| {
+                if (parseEnvSampleRate(value)) |parsed| {
+                    options.traces_sample_rate = parsed;
+                }
+            }
+        }
+
+        if (!options.accept_invalid_certs) {
+            if (env_map.get("SSL_VERIFY")) |value| {
+                if (parseEnvBool(value)) |verify| {
+                    options.accept_invalid_certs = !verify;
+                }
+            }
+        }
+    }
+
+    fn setOptionStringFromEnvIfMissing(
+        allocator: Allocator,
+        field: anytype,
+        owned_slot: *?[]u8,
+        env_map: *const std.process.EnvMap,
+        key: []const u8,
+        allow_empty_current: bool,
+    ) !void {
+        const T = @TypeOf(field.*);
+        if (comptime T == []const u8) {
+            if (!allow_empty_current or field.*.len != 0) return;
+            const value = env_map.get(key) orelse return;
+            const trimmed = std.mem.trim(u8, value, " \t\r\n");
+            if (trimmed.len == 0) return;
+            const copied = try allocator.dupe(u8, trimmed);
+            field.* = copied;
+            owned_slot.* = copied;
+            return;
+        }
+
+        if (field.* != null) return;
+        const value = env_map.get(key) orelse return;
+        const trimmed = std.mem.trim(u8, value, " \t\r\n");
+        if (trimmed.len == 0) return;
+        const copied = try allocator.dupe(u8, trimmed);
+        field.* = copied;
+        owned_slot.* = copied;
+    }
+
+    fn setOptionStringFromEnvAliasesIfMissing(
+        allocator: Allocator,
+        field: *?[]const u8,
+        owned_slot: *?[]u8,
+        env_map: *const std.process.EnvMap,
+        keys: []const []const u8,
+    ) !void {
+        if (field.* != null) return;
+        for (keys) |key| {
+            const value = env_map.get(key) orelse continue;
+            const trimmed = std.mem.trim(u8, value, " \t\r\n");
+            if (trimmed.len == 0) continue;
+            const copied = try allocator.dupe(u8, trimmed);
+            field.* = copied;
+            owned_slot.* = copied;
+            return;
+        }
+    }
+
+    fn parseEnvSampleRate(value: []const u8) ?f64 {
+        const trimmed = std.mem.trim(u8, value, " \t\r\n");
+        if (trimmed.len == 0) return null;
+        const parsed = std.fmt.parseFloat(f64, trimmed) catch return null;
+        if (!isValidSampleRate(parsed)) return null;
+        return parsed;
+    }
+
+    fn parseEnvBool(value: []const u8) ?bool {
+        const trimmed = std.mem.trim(u8, value, " \t\r\n");
+        if (trimmed.len == 0) return null;
+        if (std.ascii.eqlIgnoreCase(trimmed, "true")) return true;
+        if (std.ascii.eqlIgnoreCase(trimmed, "1")) return true;
+        if (std.ascii.eqlIgnoreCase(trimmed, "yes")) return true;
+        if (std.ascii.eqlIgnoreCase(trimmed, "on")) return true;
+        if (std.ascii.eqlIgnoreCase(trimmed, "false")) return false;
+        if (std.ascii.eqlIgnoreCase(trimmed, "0")) return false;
+        if (std.ascii.eqlIgnoreCase(trimmed, "no")) return false;
+        if (std.ascii.eqlIgnoreCase(trimmed, "off")) return false;
+        return null;
+    }
+
     fn detectServerNameAlloc(allocator: Allocator) ?[]u8 {
         if (!builtin.link_libc and builtin.os.tag != .linux) return null;
         var host_buffer: [std.posix.HOST_NAME_MAX]u8 = undefined;
@@ -1901,6 +2105,99 @@ test "Options struct has correct defaults" {
     try testing.expectEqual(@as(u64, 60_000), opts.session_aggregate_flush_interval_ms);
     try testing.expectEqual(@as(u64, 2000), opts.shutdown_timeout_ms);
     try testing.expectEqualStrings("/tmp/sentry-zig", opts.cache_dir);
+}
+
+test "applyEnvDefaultsFromMap fills missing options from environment map" {
+    var env_map = std.process.EnvMap.init(testing.allocator);
+    defer env_map.deinit();
+
+    try env_map.put("SENTRY_DSN", "https://envPublicKey@o0.ingest.sentry.io/1234567");
+    try env_map.put("SENTRY_RELEASE", "env-app@1.2.3");
+    try env_map.put("SENTRY_DIST", "android-arm64");
+    try env_map.put("SENTRY_ENVIRONMENT", "staging");
+    try env_map.put("SENTRY_NAME", "checkout-node-1");
+    try env_map.put("SENTRY_DEBUG", "true");
+    try env_map.put("SENTRY_SAMPLE_RATE", "0.25");
+    try env_map.put("SENTRY_TRACES_SAMPLE_RATE", "0.4");
+    try env_map.put("HTTPS_PROXY", "https://proxy.example.com:8443");
+    try env_map.put("HTTP_PROXY", "http://proxy.example.com:8080");
+    try env_map.put("SSL_VERIFY", "false");
+
+    var opts = Options{
+        .dsn = "",
+        .install_signal_handlers = false,
+    };
+    var owned: OwnedOptionStrings = .{};
+    defer owned.deinit(testing.allocator);
+
+    try Client.applyEnvDefaultsFromMap(testing.allocator, &opts, &owned, &env_map);
+
+    try testing.expectEqualStrings("https://envPublicKey@o0.ingest.sentry.io/1234567", opts.dsn);
+    try testing.expectEqualStrings("env-app@1.2.3", opts.release.?);
+    try testing.expectEqualStrings("android-arm64", opts.dist.?);
+    try testing.expectEqualStrings("staging", opts.environment.?);
+    try testing.expectEqualStrings("checkout-node-1", opts.server_name.?);
+    try testing.expect(opts.debug);
+    try testing.expectEqual(@as(f64, 0.25), opts.sample_rate);
+    try testing.expectEqual(@as(f64, 0.4), opts.traces_sample_rate);
+    try testing.expectEqualStrings("http://proxy.example.com:8080", opts.http_proxy.?);
+    try testing.expectEqualStrings("https://proxy.example.com:8443", opts.https_proxy.?);
+    try testing.expect(opts.accept_invalid_certs);
+}
+
+test "applyEnvDefaultsFromMap preserves explicit string options and applies env to default-valued toggles" {
+    var env_map = std.process.EnvMap.init(testing.allocator);
+    defer env_map.deinit();
+
+    try env_map.put("SENTRY_DSN", "https://envPublicKey@o0.ingest.sentry.io/999");
+    try env_map.put("SENTRY_RELEASE", "env@2.0.0");
+    try env_map.put("SENTRY_ENVIRONMENT", "production");
+    try env_map.put("SENTRY_DEBUG", "true");
+    try env_map.put("SENTRY_SAMPLE_RATE", "0.15");
+    try env_map.put("SENTRY_TRACES_SAMPLE_RATE", "0.65");
+    try env_map.put("HTTP_PROXY", "http://proxy.example.com:8080");
+    try env_map.put("SSL_VERIFY", "false");
+
+    var opts = Options{
+        .dsn = "https://explicitPublicKey@o0.ingest.sentry.io/1234567",
+        .release = "explicit@1.0.0",
+        .environment = "dev",
+        .debug = false,
+        .sample_rate = 1.0,
+        .traces_sample_rate = 0.0,
+        .http_proxy = "http://explicit.proxy.local:3128",
+        .accept_invalid_certs = false,
+        .install_signal_handlers = false,
+    };
+    var owned: OwnedOptionStrings = .{};
+    defer owned.deinit(testing.allocator);
+
+    try Client.applyEnvDefaultsFromMap(testing.allocator, &opts, &owned, &env_map);
+
+    try testing.expectEqualStrings("https://explicitPublicKey@o0.ingest.sentry.io/1234567", opts.dsn);
+    try testing.expectEqualStrings("explicit@1.0.0", opts.release.?);
+    try testing.expectEqualStrings("dev", opts.environment.?);
+    try testing.expectEqualStrings("http://explicit.proxy.local:3128", opts.http_proxy.?);
+    try testing.expect(opts.debug); // default false is still env-overridable
+    try testing.expectEqual(@as(f64, 0.15), opts.sample_rate); // default values are env-overridable
+    try testing.expectEqual(@as(f64, 0.65), opts.traces_sample_rate); // default values are env-overridable
+    try testing.expect(opts.accept_invalid_certs); // SSL_VERIFY=false enables insecure cert mode
+}
+
+test "Client initInternal accepts DSN from environment map when dsn is blank" {
+    var env_map = std.process.EnvMap.init(testing.allocator);
+    defer env_map.deinit();
+
+    try env_map.put("SENTRY_DSN", "https://envPublicKey@o0.ingest.sentry.io/1234567");
+    try env_map.put("SENTRY_RELEASE", "env-release@1.0.0");
+
+    const client = try Client.initInternal(testing.allocator, .{
+        .dsn = "",
+        .install_signal_handlers = false,
+    }, &env_map);
+    defer client.deinit();
+
+    try testing.expectEqualStrings("env-release@1.0.0", client.options.release.?);
 }
 
 test "Client struct size is non-zero" {

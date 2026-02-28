@@ -151,6 +151,28 @@ defer guard.deinit();
 _ = sentry.captureMessage("captured through global API", .info);
 ```
 
+### Environment-default bootstrap
+
+Use env-default helpers when deployment injects runtime configuration through environment variables.
+
+```zig
+const client = try sentry.initWithEnvDefaults(allocator, .{
+    .dsn = "", // allow SENTRY_DSN to provide DSN
+    .install_signal_handlers = false,
+});
+defer client.deinit();
+```
+
+Global variant:
+
+```zig
+var guard = try sentry.initGlobalWithEnvDefaults(allocator, .{
+    .dsn = "",
+    .install_signal_handlers = false,
+});
+defer guard.deinit();
+```
+
 ### std.log integration helper
 
 Set a custom `std_options.logFn` in your app root and install integration config:
@@ -611,6 +633,19 @@ Key methods:
 - `deinit()` - standard safe shutdown path.
 
 If `Options.integrations` is provided, each integration setup callback runs during client initialization.
+
+`initWithEnvDefaults` / `initGlobalWithEnvDefaults` resolve missing values from:
+- `SENTRY_DSN` (used only when `.dsn` is blank)
+- `SENTRY_RELEASE`
+- `SENTRY_DIST`
+- `SENTRY_ENVIRONMENT`
+- `SENTRY_NAME`
+- `SENTRY_DEBUG`
+- `SENTRY_SAMPLE_RATE`
+- `SENTRY_TRACES_SAMPLE_RATE`
+- `HTTP_PROXY` / `http_proxy`
+- `HTTPS_PROXY` / `https_proxy`
+- `SSL_VERIFY` (`false` enables `accept_invalid_certs`)
 
 ```zig
 fn setupIntegration(client: *sentry.Client, _: ?*anyopaque) void {
