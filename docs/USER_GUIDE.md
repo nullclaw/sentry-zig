@@ -411,6 +411,24 @@ const status = try sentry.integrations.std_http.runIncomingRequest(
 _ = status;
 ```
 
+`std.http` HeaderIterator variant:
+
+```zig
+var it = request.iterateHeaders();
+const status = try sentry.integrations.std_http.runIncomingRequestFromHeaderIteratorTyped(
+    allocator,
+    client,
+    request.head.method,
+    request.head.target,
+    &it,
+    .{}, // defaults transaction_name to request path when omitted
+    incomingTypedHandler,
+    handler_state,
+    .{},
+);
+_ = status;
+```
+
 ### Outgoing HTTP request integration helper
 
 Use `integrations.http.OutgoingRequestContext` inside an active transaction/span
@@ -482,6 +500,23 @@ const upstream_status = try sentry.integrations.auto.runOutgoingRequestWithCurre
     .{
         .method = "POST",
         .url = "https://payments.example.com/charge",
+    },
+    outgoingTyped,
+    &out_state,
+    .{},
+);
+_ = upstream_status;
+```
+
+`std.http` outgoing wrapper variant:
+
+```zig
+var out_state = OutState{};
+const upstream_status = try sentry.integrations.std_http.runOutgoingRequestTyped(
+    .{
+        .method = .POST,
+        .url = "https://payments.example.com/charge",
+        .description = "POST charge",
     },
     outgoingTyped,
     &out_state,

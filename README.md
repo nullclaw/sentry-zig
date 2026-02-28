@@ -491,6 +491,23 @@ _ = status;
 ```
 
 ```zig
+// std.http HeaderIterator variant (no intermediate header array)
+var it = request.iterateHeaders();
+const status = try sentry.integrations.std_http.runIncomingRequestFromHeaderIteratorTyped(
+    allocator,
+    client,
+    request.head.method,
+    request.head.target,
+    &it,
+    .{}, // transaction_name defaults to request path when omitted
+    incomingTypedHandler,
+    handler_state,
+    .{},
+);
+_ = status;
+```
+
+```zig
 // Downstream HTTP helper: child span + propagation headers + status mapping
 var out = try sentry.integrations.http.OutgoingRequestContext.begin(.{
     .method = "POST",
@@ -534,6 +551,21 @@ const code = try sentry.integrations.auto.runOutgoingRequestWithCurrentHubTyped(
     .{},
 );
 _ = code;
+```
+
+```zig
+// std.http outgoing wrapper + direct std.http.Header propagation
+var status = try sentry.integrations.std_http.runOutgoingRequestTyped(
+    .{
+        .method = .POST,
+        .url = "https://payments.example.com/charge",
+        .description = "POST charge",
+    },
+    outgoingTyped,
+    &out_state,
+    .{},
+);
+_ = status;
 ```
 
 ```zig
