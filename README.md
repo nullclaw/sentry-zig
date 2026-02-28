@@ -508,6 +508,19 @@ _ = status;
 ```
 
 ```zig
+// std.http Server.Request direct variant (method/target/headers extracted automatically)
+const status = try sentry.integrations.std_http.runIncomingServerRequestWithCurrentHubTyped(
+    allocator,
+    request,
+    .{ .transaction_name = "GET /orders/:id" },
+    incomingTypedHandler,
+    handler_state,
+    .{},
+);
+_ = status;
+```
+
+```zig
 // Downstream HTTP helper: child span + propagation headers + status mapping
 var out = try sentry.integrations.http.OutgoingRequestContext.begin(.{
     .method = "POST",

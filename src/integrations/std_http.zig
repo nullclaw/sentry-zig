@@ -124,6 +124,24 @@ pub fn beginIncomingRequestFromHeaderIterator(
     return http.RequestContext.begin(allocator, client, request_options);
 }
 
+/// Start incoming instrumentation directly from `std.http.Server.Request`.
+pub fn beginIncomingServerRequest(
+    allocator: std.mem.Allocator,
+    client: *Client,
+    request: *const std.http.Server.Request,
+    options: IncomingOptions,
+) !http.RequestContext {
+    var header_it = request.iterateHeaders();
+    return beginIncomingRequestFromHeaderIterator(
+        allocator,
+        client,
+        request.head.method,
+        request.head.target,
+        &header_it,
+        options,
+    );
+}
+
 /// Run incoming HTTP handler using std.http method/target/headers.
 pub fn runIncomingRequest(
     allocator: std.mem.Allocator,
@@ -179,6 +197,30 @@ pub fn runIncomingRequestFromHeaderIterator(
     );
 }
 
+/// Run incoming handler using `std.http.Server.Request` as source metadata.
+pub fn runIncomingServerRequest(
+    allocator: std.mem.Allocator,
+    client: *Client,
+    request: *const std.http.Server.Request,
+    options: IncomingOptions,
+    handler: http.IncomingHandlerFn,
+    handler_ctx: ?*anyopaque,
+    run_options: http.IncomingRunOptions,
+) anyerror!u16 {
+    var header_it = request.iterateHeaders();
+    return runIncomingRequestFromHeaderIterator(
+        allocator,
+        client,
+        request.head.method,
+        request.head.target,
+        &header_it,
+        options,
+        handler,
+        handler_ctx,
+        run_options,
+    );
+}
+
 /// Typed variant of `runIncomingRequest`.
 pub fn runIncomingRequestTyped(
     allocator: std.mem.Allocator,
@@ -197,6 +239,30 @@ pub fn runIncomingRequestTyped(
         allocator,
         client,
         request_options,
+        handler,
+        handler_ctx,
+        run_options,
+    );
+}
+
+/// Typed variant of `runIncomingServerRequest`.
+pub fn runIncomingServerRequestTyped(
+    allocator: std.mem.Allocator,
+    client: *Client,
+    request: *const std.http.Server.Request,
+    options: IncomingOptions,
+    comptime handler: anytype,
+    handler_ctx: anytype,
+    run_options: http.IncomingRunOptions,
+) anyerror!u16 {
+    var header_it = request.iterateHeaders();
+    return runIncomingRequestFromHeaderIteratorTyped(
+        allocator,
+        client,
+        request.head.method,
+        request.head.target,
+        &header_it,
+        options,
         handler,
         handler_ctx,
         run_options,
@@ -259,6 +325,27 @@ pub fn runIncomingRequestWithCurrentHub(
     );
 }
 
+/// Current-hub variant of `runIncomingServerRequest`.
+pub fn runIncomingServerRequestWithCurrentHub(
+    allocator: std.mem.Allocator,
+    request: *const std.http.Server.Request,
+    options: IncomingOptions,
+    handler: http.IncomingHandlerFn,
+    handler_ctx: ?*anyopaque,
+    run_options: http.IncomingRunOptions,
+) anyerror!u16 {
+    const hub = Hub.current() orelse return error.NoCurrentHub;
+    return runIncomingServerRequest(
+        allocator,
+        hub.clientPtr(),
+        request,
+        options,
+        handler,
+        handler_ctx,
+        run_options,
+    );
+}
+
 /// Typed current-hub variant of `runIncomingRequest`.
 pub fn runIncomingRequestWithCurrentHubTyped(
     allocator: std.mem.Allocator,
@@ -277,6 +364,27 @@ pub fn runIncomingRequestWithCurrentHubTyped(
         method,
         target,
         headers,
+        options,
+        handler,
+        handler_ctx,
+        run_options,
+    );
+}
+
+/// Typed current-hub variant of `runIncomingServerRequest`.
+pub fn runIncomingServerRequestWithCurrentHubTyped(
+    allocator: std.mem.Allocator,
+    request: *const std.http.Server.Request,
+    options: IncomingOptions,
+    comptime handler: anytype,
+    handler_ctx: anytype,
+    run_options: http.IncomingRunOptions,
+) anyerror!u16 {
+    const hub = Hub.current() orelse return error.NoCurrentHub;
+    return runIncomingServerRequestTyped(
+        allocator,
+        hub.clientPtr(),
+        request,
         options,
         handler,
         handler_ctx,
@@ -483,6 +591,31 @@ fn outgoingTypedHandler(context: *http.OutgoingRequestContext, state: *OutgoingS
     return 202;
 }
 
+const ServerRequestFixture = struct {
+    server: std.http.Server,
+    request: std.http.Server.Request,
+};
+
+fn initServerRequestFixture(fixture: *ServerRequestFixture, head_buffer: []const u8) !void {
+    fixture.server = .{
+        .reader = .{
+            .in = undefined,
+            .state = .received_head,
+            .interface = undefined,
+            .max_head_len = 4096,
+        },
+        .out = undefined,
+    };
+
+    const head = try std.http.Server.Request.Head.parse(head_buffer);
+    fixture.request = .{
+        .server = &fixture.server,
+        .head = head,
+        .head_buffer = head_buffer,
+        .respond_err = null,
+    };
+}
+
 test "std_http runIncomingRequest maps method target and propagation headers" {
     var payload_state = PayloadState{ .allocator = testing.allocator };
     defer payload_state.deinit();
@@ -679,6 +812,134 @@ test "std_http runIncomingRequestFromHeaderIteratorTyped supports default transa
         saw_transaction = true;
         try testing.expect(std.mem.indexOf(u8, payload, "\"transaction\":\"/orders/42\"") != null);
         try testing.expect(std.mem.indexOf(u8, payload, "\"trace_id\":\"0123456789abcdef0123456789abcdef\"") != null);
+    }
+    try testing.expect(saw_transaction);
+}
+
+test "std_http runIncomingServerRequest maps method target and propagation headers" {
+    var payload_state = PayloadState{ .allocator = testing.allocator };
+    defer payload_state.deinit();
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .transport = .{
+            .send_fn = payloadSendFn,
+            .ctx = &payload_state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    const request_bytes =
+        "GET /orders/42?expand=items HTTP/1.1\r\n" ++
+        "traceparent: 00-0123456789abcdef0123456789abcdef-89abcdef01234567-01\r\n" ++
+        "baggage: sentry-release=std-http-server,sentry-environment=test\r\n" ++
+        "\r\n";
+    var fixture: ServerRequestFixture = undefined;
+    try initServerRequestFixture(&fixture, request_bytes);
+
+    var state = IncomingState{};
+    const status_code = try runIncomingServerRequest(
+        testing.allocator,
+        client,
+        &fixture.request,
+        .{ .transaction_name = "GET /orders/:id" },
+        incomingHandler,
+        &state,
+        .{},
+    );
+    try testing.expectEqual(@as(u16, 204), status_code);
+    try testing.expect(state.seen);
+
+    try testing.expect(client.flush(1000));
+
+    var saw_transaction = false;
+    for (payload_state.payloads.items) |payload| {
+        if (std.mem.indexOf(u8, payload, "\"type\":\"transaction\"") == null) continue;
+        saw_transaction = true;
+        try testing.expect(std.mem.indexOf(u8, payload, "\"name\":\"GET /orders/:id\"") != null);
+        try testing.expect(std.mem.indexOf(u8, payload, "\"trace_id\":\"0123456789abcdef0123456789abcdef\"") != null);
+        try testing.expect(std.mem.indexOf(u8, payload, "\"method\":\"GET\"") != null);
+        try testing.expect(std.mem.indexOf(u8, payload, "\"url\":\"/orders/42\"") != null);
+        try testing.expect(std.mem.indexOf(u8, payload, "\"query_string\":\"expand=items\"") != null);
+    }
+    try testing.expect(saw_transaction);
+}
+
+test "std_http runIncomingServerRequestWithCurrentHubTyped requires current hub" {
+    _ = Hub.clearCurrent();
+    try testing.expect(Hub.current() == null);
+
+    const request_bytes = "GET /health HTTP/1.1\r\n\r\n";
+    var fixture: ServerRequestFixture = undefined;
+    try initServerRequestFixture(&fixture, request_bytes);
+    var state = IncomingState{};
+
+    try testing.expectError(
+        error.NoCurrentHub,
+        runIncomingServerRequestWithCurrentHubTyped(
+            testing.allocator,
+            &fixture.request,
+            .{},
+            incomingTypedHandler,
+            &state,
+            .{},
+        ),
+    );
+}
+
+test "std_http runIncomingServerRequestWithCurrentHubTyped uses typed context" {
+    var payload_state = PayloadState{ .allocator = testing.allocator };
+    defer payload_state.deinit();
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .transport = .{
+            .send_fn = payloadSendFn,
+            .ctx = &payload_state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var hub = try Hub.init(testing.allocator, client);
+    defer hub.deinit();
+    _ = Hub.setCurrent(&hub);
+    defer _ = Hub.clearCurrent();
+
+    const request_bytes =
+        "POST /typed/server?mode=fast HTTP/1.1\r\n" ++
+        "sentry-trace: fedcba9876543210fedcba9876543210-0123456789abcdef-1\r\n" ++
+        "\r\n";
+    var fixture: ServerRequestFixture = undefined;
+    try initServerRequestFixture(&fixture, request_bytes);
+    var state = IncomingState{};
+
+    const status_code = try runIncomingServerRequestWithCurrentHubTyped(
+        testing.allocator,
+        &fixture.request,
+        .{ .transaction_name = "POST /typed/server" },
+        incomingTypedHandler,
+        &state,
+        .{},
+    );
+    try testing.expectEqual(@as(u16, 205), status_code);
+    try testing.expect(state.seen);
+
+    try testing.expect(client.flush(1000));
+
+    var saw_transaction = false;
+    for (payload_state.payloads.items) |payload| {
+        if (std.mem.indexOf(u8, payload, "\"type\":\"transaction\"") == null) continue;
+        saw_transaction = true;
+        try testing.expect(std.mem.indexOf(u8, payload, "\"name\":\"POST /typed/server\"") != null);
+        try testing.expect(std.mem.indexOf(u8, payload, "\"trace_id\":\"fedcba9876543210fedcba9876543210\"") != null);
+        try testing.expect(std.mem.indexOf(u8, payload, "\"method\":\"POST\"") != null);
+        try testing.expect(std.mem.indexOf(u8, payload, "\"url\":\"/typed/server\"") != null);
+        try testing.expect(std.mem.indexOf(u8, payload, "\"query_string\":\"mode=fast\"") != null);
+        try testing.expect(std.mem.indexOf(u8, payload, "\"handler\":\"std-http-typed\"") != null);
     }
     try testing.expect(saw_transaction);
 }

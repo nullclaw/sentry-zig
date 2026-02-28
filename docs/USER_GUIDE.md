@@ -429,6 +429,20 @@ const status = try sentry.integrations.std_http.runIncomingRequestFromHeaderIter
 _ = status;
 ```
 
+`std.http.Server.Request` direct variant:
+
+```zig
+const status = try sentry.integrations.std_http.runIncomingServerRequestWithCurrentHubTyped(
+    allocator,
+    request,
+    .{ .transaction_name = "GET /orders/:id" },
+    incomingTypedHandler,
+    handler_state,
+    .{},
+);
+_ = status;
+```
+
 ### Outgoing HTTP request integration helper
 
 Use `integrations.http.OutgoingRequestContext` inside an active transaction/span
